@@ -229,46 +229,52 @@ Notebook nên dùng cho:
 ## 8. Phân công thành viên và file chính
 
 ### Phúc (TV1) — Data Engineer
-- `crawl_sources.py`: crawl danh sách văn bản, tải HTML và lưu nguồn thô
-- `parse_clean.py`: bóc tách nội dung, làm sạch văn bản, chuẩn hóa metadata
-- `chunk_legal_docs.py`: chia văn bản theo Điều/Khoản/Điểm để tạo chunk
-- `incremental_sync.py`: đồng bộ văn bản mới mà không cần rebuild toàn bộ dữ liệu
+Các file chính và nhiệm vụ:
+- `crawl_sources.py` — crawl danh sách văn bản pháp luật từ nguồn công khai, tải HTML và lưu nguồn thô để xử lý tiếp.
+- `parse_clean.py` — bóc tách nội dung, loại bỏ nhiễu HTML, chuẩn hóa metadata như số hiệu, ngày ban hành, cơ quan ban hành, lĩnh vực.
+- `chunk_legal_docs.py` — chia văn bản theo Điều/Khoản/Điểm, tạo chunk và manifest phục vụ indexing.
+- `incremental_sync.py` — phát hiện văn bản mới hoặc văn bản thay đổi và đồng bộ tăng dần mà không cần rebuild toàn bộ dữ liệu.
 
 ### Dũng (TV2) — Embedding & Vector DB
-- `embedding_registry.py`: quản lý embedding models và cấu hình encode
-- `build_qdrant_index.py`: sinh embedding, build collection article-level/chunk-level và nạp dữ liệu lên Qdrant
-- `qdrant_manager.py`: tạo collection, alias, policy cập nhật chỉ mục
-- `search_with_filters.py`: semantic search có lọc metadata/ngày/lĩnh vực
-- `swap_active_collection.py`: chuyển collection active sang index mới an toàn
+Các file chính và nhiệm vụ:
+- `embedding_registry.py` — quản lý embedding models, cấu hình encode và lựa chọn model active cho indexing/search.
+- `build_qdrant_index.py` — sinh embedding, tạo collection article-level hoặc chunk-level và nạp dữ liệu lên Qdrant.
+- `qdrant_manager.py` — tạo collection, thiết lập alias, quản lý lifecycle của index và chính sách cập nhật.
+- `search_with_filters.py` — thực hiện semantic search có lọc theo metadata như ngày ban hành, lĩnh vực, loại văn bản.
+- `swap_active_collection.py` — chuyển collection active sang index mới để cập nhật an toàn, hạn chế downtime.
 
 ### Huy (TV3) — Retrieval Agent
-- `rewrite_query_node.py`: rewrite query theo hướng multi-query
-- `retrieve_node.py`: hybrid retrieval giữa BM25 và vector search
-- `rerank_node.py`: rerank candidate bằng CrossEncoder
-- `retrieval_check_node.py`: kiểm tra evidence đã đủ mạnh hay chưa
-- `fallback_policy.py`: quyết định retry retrieval / tăng top-k / fallback
+Các file chính và nhiệm vụ:
+- `rewrite_query_node.py` — viết lại câu hỏi theo hướng multi-query để tăng khả năng recall và bao phủ thuật ngữ pháp lý.
+- `retrieve_node.py` — thực hiện hybrid retrieval giữa BM25 và vector search từ Qdrant.
+- `rerank_node.py` — sắp xếp lại candidate bằng CrossEncoder để đưa các chứng cứ liên quan nhất lên đầu.
+- `retrieval_check_node.py` — đánh giá evidence đã đủ mạnh hay chưa dựa trên score, độ phủ và chất lượng nguồn.
+- `fallback_policy.py` — quyết định khi nào cần retry retrieval, tăng top-k, đổi query hoặc fallback sang nhánh an toàn hơn.
 
 ### Cường (TV4) — Router + Frontend
-- `intent_classifier.py`: phân loại intent và confidence score
-- `route_node.py`: quyết định nhánh chạy tiếp theo
-- `clarify_detector.py`: phát hiện câu hỏi mơ hồ hoặc thiếu dữ kiện
-- `risk_tagger.py`: gắn nhãn risk level cho câu hỏi pháp lý nhạy cảm
-- `streamlit_app.py`: giao diện chat, nguồn trích dẫn, routing state, history
+Các file chính và nhiệm vụ:
+- `intent_classifier.py` — phân loại intent và tính confidence score cho câu hỏi người dùng.
+- `route_node.py` — quyết định nhánh chạy tiếp theo của graph như clarify, fast path hay legal agent path.
+- `clarify_detector.py` — phát hiện câu hỏi mơ hồ, thiếu dữ kiện hoặc quá ngắn để yêu cầu người dùng làm rõ.
+- `risk_tagger.py` — gắn nhãn risk level cho các câu hỏi pháp lý nhạy cảm để kích hoạt nhánh kiểm soát phù hợp.
+- `streamlit_app.py` — xây dựng giao diện chat, hiển thị nguồn trích dẫn, trạng thái routing và lịch sử hội thoại.
 
 ### Đại (TV5) — Legal Reasoning Agent
-- `prompt_library.py`: prompt theo intent, bằng chứng và loại tác vụ
-- `generate_draft_node.py`: sinh bản nháp câu trả lời
-- `grounding_check_node.py`: kiểm tra claim có được evidence hỗ trợ hay không
-- `revise_answer_node.py`: viết lại khi grounding chưa đạt
-- `citation_critic.py`: kiểm tra chất lượng citation và format trích dẫn
+Các file chính và nhiệm vụ:
+- `prompt_library.py` — quản lý prompt theo intent, mức độ rủi ro, loại bằng chứng và loại tác vụ sinh câu trả lời.
+- `generate_draft_node.py` — sinh bản nháp câu trả lời pháp lý từ evidence đã truy xuất.
+- `grounding_check_node.py` — kiểm tra từng claim trong câu trả lời có được evidence hỗ trợ hay không.
+- `revise_answer_node.py` — viết lại câu trả lời khi grounding chưa đạt hoặc cần làm rõ hơn căn cứ pháp lý.
+- `citation_critic.py` — kiểm tra chất lượng citation, định dạng trích dẫn và phát hiện citation sai hoặc thiếu.
 
 ### Dương (TV6) — LangGraph Orchestration + FastAPI
-- `state.py`: định nghĩa `AgentState`
-- `builder.py`: lắp ghép graph, node, edge, routing
-- `subgraphs.py`: đóng gói reusable subgraphs
-- `human_review_node.py`: triển khai interrupt/resume cho human review
-- `checkpointing.py`: lưu checkpoint và resume theo `thread_id/session_id`
-- `main.py`, `chat.py`, `stream.py`: backend API đồng bộ và streaming
+Các file chính và nhiệm vụ:
+- `state.py` — định nghĩa `AgentState` và các trường dữ liệu dùng chung cho toàn bộ graph.
+- `builder.py` — lắp ghép graph, khai báo node, edge, routing và các loop kiểm tra chất lượng.
+- `subgraphs.py` — đóng gói các subgraph có thể tái sử dụng như legal path hoặc review path.
+- `human_review_node.py` — triển khai interrupt/resume cho human review trong các trường hợp nhạy cảm hoặc độ tin cậy thấp.
+- `checkpointing.py` — lưu checkpoint và khôi phục graph theo `thread_id/session_id`.
+- `main.py`, `chat.py`, `stream.py` — cung cấp backend API cho chế độ đồng bộ và streaming.
 
 ---
 
