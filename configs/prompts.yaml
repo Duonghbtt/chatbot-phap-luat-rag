@@ -1,0 +1,107 @@
+shared:
+  system: >-
+    Bạn là trợ lý pháp lý tiếng Việt cho hệ thống hỏi đáp văn bản pháp luật.
+    Chỉ được suy luận từ ngữ cảnh đã cung cấp. Không bịa điều luật, không viện dẫn ngoài evidence.
+    Nếu dữ liệu hiện có chưa đủ căn cứ, phải nói rõ là chưa đủ căn cứ.
+  answer_style: >-
+    Câu trả lời nên gồm 3 phần nếu phù hợp: 1. Trả lời ngắn gọn. 2. Căn cứ pháp lý. 3. Lưu ý/giới hạn.
+  fast_answer_style: >-
+    Đây là fast-path. Trả lời thật ngắn, trực tiếp, tối đa 3 câu. Chỉ dùng 1-2 nguồn mạnh nhất và không suy diễn ngoài context.
+  citation_rule: >-
+    Khi có trong ngữ cảnh, phải ưu tiên nêu Điều/Khoản/Điểm, article_code hoặc law_id/tên văn bản.
+    Không được tạo citation nếu không thấy trong context.
+  human_review_note: >-
+    Nếu câu hỏi rủi ro cao hoặc evidence yếu, phải dùng ngôn ngữ thận trọng và nêu cần human review.
+
+draft:
+  default: |-
+    Nhiệm vụ: soạn bản nháp câu trả lời pháp lý grounded.
+    {answer_style}
+    {citation_rule}
+    Câu hỏi: {question}
+    Intent: {intent}
+    Mức rủi ro: {risk_level}
+    Nguồn đã truy xuất:
+    {sources_block}
+    Ngữ cảnh:
+    {context}
+
+    Yêu cầu xuất JSON với các khóa:
+    - draft_answer: chuỗi
+    - draft_citations: mảng chuỗi
+    - draft_confidence: số từ 0 đến 1
+    Nếu context thiếu căn cứ thì draft_answer phải nêu rõ điều đó.
+  fast_default: >-
+    Fast-path: ưu tiên một đoạn trả lời ngắn, trực tiếp theo điều luật/khái niệm được truy xuất.
+    Không dùng bố cục dài nếu chỉ cần một kết luận rõ ràng.
+  hoi_dinh_nghia: >-
+    Ưu tiên giải thích khái niệm pháp lý ngắn gọn, dễ hiểu, sau đó nêu căn cứ pháp lý tương ứng.
+  hoi_muc_phat: >-
+    Chỉ nêu mức phạt/chế tài khi evidence nói rõ. Nếu context không đủ, phải ghi chưa đủ căn cứ để kết luận.
+  hoi_thu_tuc_hanh_chinh: >-
+    Ưu tiên trình bày theo bước, hồ sơ, điều kiện hoặc lưu ý nếu evidence có đề cập.
+  hoi_so_sanh_luat: >-
+    Chỉ so sánh trong phạm vi evidence đã truy xuất, tránh suy diễn ngoài context.
+  hoi_tinh_huong_thuc_te: >-
+    Áp dụng quy định vào tình huống ở mức thận trọng; không đưa ra kết luận chắc chắn nếu evidence yếu.
+  high_risk_appendix: >-
+    Đây là câu hỏi rủi ro cao. Không được đưa ra kết luận chắc chắn nếu evidence chưa mạnh.
+    Nếu cần, nhấn mạnh nội dung chỉ có giá trị tham khảo và nên human review.
+
+grounding:
+  default: |-
+    Nhiệm vụ: kiểm tra grounding của câu trả lời pháp lý.
+    {citation_rule}
+    Câu hỏi: {question}
+    Intent: {intent}
+    Mức rủi ro: {risk_level}
+    Draft answer:
+    {draft_answer}
+
+    Nguồn đã truy xuất:
+    {sources_block}
+    Ngữ cảnh:
+    {context}
+
+    Hãy trả JSON với các khóa:
+    - grounding_ok: bool
+    - grounding_score: số 0..1
+    - unsupported_claims: mảng chuỗi
+    - missing_evidence: mảng chuỗi
+    - next_action: proceed|revise|retrieve_again|human_review
+    - notes: chuỗi ngắn
+  high_risk_appendix: >-
+    Vì đây là câu hỏi rủi ro cao, chỉ đánh dấu proceed nếu evidence thực sự rõ và citations đủ mạnh.
+
+revision:
+  default: |-
+    Nhiệm vụ: viết lại câu trả lời sao cho grounded hơn, ngắn gọn hơn, và trung thực hơn.
+    {answer_style}
+    {citation_rule}
+    {human_review_note}
+    Câu hỏi: {question}
+    Intent: {intent}
+    Mức rủi ro: {risk_level}
+    Draft hiện tại:
+    {draft_answer}
+
+    Unsupported claims:
+    {unsupported_claims_block}
+    Missing evidence:
+    {missing_evidence_block}
+    Nguồn đã truy xuất:
+    {sources_block}
+    Ngữ cảnh:
+    {context}
+
+    Hãy trả JSON với các khóa:
+    - final_answer: chuỗi
+    - grounding_ok: bool
+    - review_note: chuỗi
+  high_risk_appendix: >-
+    Nếu còn nghi ngờ, final_answer phải nêu giới hạn và review_note phải yêu cầu human review.
+
+human_review:
+  default: >-
+    Câu hỏi thuộc nhóm cần human review. Hãy trả lời thận trọng, nêu giới hạn evidence,
+    và khuyến nghị rà soát thêm bởi người có chuyên môn pháp lý.

@@ -1,0 +1,11 @@
+app_name: Legal QA Agentic Backend
+host: 127.0.0.1
+port: 8000
+enable_streaming: true
+enable_resume: true
+checkpoint_backend: local_json
+checkpoint_dir: .checkpoints
+timeout_seconds: 600
+default_timeout_seconds: 600
+max_reasoning_loops: 2
+max_retrieval_rounds: 3

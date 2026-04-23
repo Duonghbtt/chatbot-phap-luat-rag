@@ -1,0 +1,52 @@
+qdrant:
+  url: ${QDRANT_URL:http://localhost:6333}
+  api_key: ${QDRANT_API_KEY:}
+  prefer_grpc: false
+  distance: cosine
+  hnsw_config:
+    m: 32
+    ef_construct: 128
+    full_scan_threshold: 10000
+
+embedding:
+  provider: ollama
+  fallback_provider: sentence_transformers
+  model_name: bge-m3
+  sentence_transformers_model_name: BAAI/bge-m3
+  vector_dim: 1024
+  batch_size: 32
+  normalize_embeddings: true
+  ollama_base_url: ${OLLAMA_BASE_URL:http://localhost:11434}
+  ollama_timeout_seconds: 120
+
+collections:
+  chunk_collection_prefix: legal_chunks
+  article_collection_prefix: legal_articles
+  active_chunk_alias: legal_chunks_active
+  active_article_alias: legal_articles_active
+
+indexing:
+  level: article
+  top_k_default: 5
+  batch_upsert_size: 64
+  recreate_if_exists: false
+  keep_last_n_versions: 3
+  insert_max_retries: 3
+  insert_retry_backoff_seconds: 2.0
+  delete_stale_points_on_incremental: true
+  text_field_for_embedding: retrieval_text
+
+payload_fields:
+  law_id: keyword
+  topic_id: keyword
+  title: keyword
+  issuer: keyword
+  article: keyword
+  effective_date: keyword
+  effective_date_iso: datetime
+  de_muc: keyword
+  article_code: keyword
+  article_name: keyword
+  file_id: keyword
+  mapc: keyword
+  doc_type: keyword

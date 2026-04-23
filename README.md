@@ -1,160 +1,393 @@
-# Hệ thống Hỏi Đáp Văn Bản Pháp Luật Đa Tác Tử sử dụng RAG và LangGraph
+# Hệ thống Hỏi Đáp Văn Bản Pháp Luật Đa Tác Tử dùng RAG và LangGraph
 
-> Bài tập lớn môn Xử lý Ngôn ngữ Tự nhiên (NLP)  
-> Kiến trúc: **Agentic Multi-Agent RAG** với **LangGraph + Qdrant + FastAPI + Streamlit**
+> Báo cáo cập nhật theo kiến trúc hiện tại của hệ thống.  
+> Stack chính: **LangGraph + Hybrid Retrieval + Qdrant + FastAPI + Streamlit**.
 
 ## 1. Giới thiệu
 
-Dự án xây dựng một hệ thống chatbot hỏi đáp văn bản pháp luật tiếng Việt có khả năng:
+Dự án xây dựng một hệ thống hỏi đáp văn bản pháp luật tiếng Việt theo kiến trúc agentic mức 3. Hệ thống không chỉ truy xuất tài liệu và sinh câu trả lời, mà còn:
 
-- hiểu câu hỏi pháp lý bằng ngôn ngữ tự nhiên,
-- phân loại intent và mức độ rủi ro,
-- truy xuất các điều luật liên quan bằng **Hybrid Search**,
-- sinh câu trả lời có căn cứ và trích dẫn,
-- tự kiểm tra grounding/citation trước khi trả lời,
-- chuyển sang **human review** ở các trường hợp nhạy cảm hoặc độ tin cậy thấp.
+- phân tích câu hỏi để xác định intent và mức rủi ro,
+- chọn nhánh xử lý phù hợp giữa `fast-path`, `legal-agent-path`, `clarify-path`, `human-review-path`, `unsupported-path`,
+- dùng checkpoint để dừng và tiếp tục hội thoại theo `thread_id` và `session_id`,
+- hỗ trợ cơ chế hỏi ngược lại trong chat khi thiếu dữ kiện hoặc cần xác nhận phạm vi trả lời,
+- stream event backend theo thời gian thực qua SSE.
 
-Khác với pipeline RAG tuyến tính, phiên bản này triển khai theo hướng **LangGraph agentic workflow**: có routing, retry loop, grounding check, checkpoint và interrupt/resume.
+Khác với pipeline RAG tuyến tính, phiên bản hiện tại tách rõ:
 
----
+- **fast-path** cho câu hỏi đơn giản, low-risk, xử lý nhẹ và nhanh,
+- **legal-agent-path** cho câu hỏi pháp lý đầy đủ hoặc phức tạp, có retry và revise loop,
+- **waiting_user_input** cho các trường hợp cần người dùng trả lời tiếp ngay trong khung chat.
 
-## 2. Mục tiêu dự án
+## 2. Mục tiêu hệ thống
 
-- Xây dựng pipeline chuẩn hóa và chuẩn hóa văn bản pháp luật.
-- Xây dựng vector database trên Qdrant và hybrid retrieval cho tiếng Việt.
-- Tổ chức hệ thống bằng **stateful graph** trên LangGraph.
-- Bổ sung các cơ chế “chuẩn LangGraph hơn”:
-  - route theo intent/risk,
-  - retry retrieval khi evidence yếu,
-  - grounding check trước khi phát hành câu trả lời,
-  - human-in-the-loop cho câu hỏi nhạy cảm,
-  - resume từ checkpoint theo `thread_id` / `session_id`.
+- Xây dựng quy trình ingest, chuẩn hóa và lập chỉ mục văn bản pháp luật.
+- Tổ chức retrieval theo Hybrid Search giữa BM25 và vector search.
+- Điều phối toàn bộ hệ thống bằng `LangGraph` với `AgentState` dùng chung.
+- Tách execution policy giữa fast-path và full legal path để giảm độ trễ.
+- Hỗ trợ `interrupt/resume` qua `checkpoint` cho clarify và human-in-the-loop.
+- Cung cấp backend `FastAPI` và frontend `Streamlit` để chạy hội thoại thực tế.
 
----
+## 3. Kiến trúc agentic hiện tại
 
-## 3. Kiến trúc agentic mức 3
+### 3.1 Thành phần chính
 
-### 3.1 Luồng tổng quát
+- **TV1 - Data**: ingest, parse, chunk văn bản pháp luật.
+- **TV2 - Index**: embedding, Qdrant index, collection lifecycle.
+- **TV3 - Retrieval**: rewrite query, retrieve, rerank, retrieval check, fallback policy.
+- **TV4 - Router**: intent classification, risk tagging, clarify detection, route decision.
+- **TV5 - Reasoning**: generate draft, grounding check, revise answer, citation critic.
+- **TV6 - Orchestration**: LangGraph builder, subgraph, checkpointing, FastAPI, streaming, resume.
 
-```text
-User Input
-   ↓
-analyze_node
-   ↓
-route_node
-   ├── clarify_node
-   ├── fast_path_node
-   └── legal_agent_subgraph
-            ↓
-     classify_intent_node
-            ↓
-      rewrite_query_node
-            ↓
-        retrieve_node
-            ↓
-         rerank_node
-            ↓
-   retrieval_check_node
-      ├── retry retrieve
-      └── generate_draft_node
-                 ↓
-      grounding_check_node
-         ├── retry retrieve
-         ├── revise_answer_node
-         └── human_review_node
-                    ↓
-            citation_format_node
-                    ↓
-             final_answer_node
+### 3.2 Luồng tổng quát của hệ thống
+
+```mermaid
+flowchart TD
+    A["User hỏi"] --> B["analyze_node"]
+    B --> C["route_node"]
+
+    C -->|"clarify-path"| D["waiting_user_input<br/>resume_kind=clarify"]
+    C -->|"human-review-path"| E["waiting_user_input<br/>resume_kind=human_review"]
+    C -->|"unsupported-path"| F["unsupported_node"]
+    C -->|"fast-path"| G["Fast Path"]
+    C -->|"legal-agent-path"| H["Full Legal Path"]
+
+    D -->|"user trả lời tiếp<br/>/chat/resume"| I["resume clarify"]
+    E -->|"user trả lời tiếp<br/>/chat/resume"| J["resume human review"]
+
+    I --> C
+    J --> H
+
+    G --> K["citation_format_node"]
+    H --> K
+    F --> K
+    K --> L["final_answer_node"]
+    L --> M["API response / SSE final_state"]
 ```
 
-### 3.2 Điểm nổi bật của kiến trúc
+Luồng hiện tại có 5 nhánh ở `route_node`:
 
-- **Stateful:** mọi node cùng đọc/ghi `AgentState`
-- **Branching:** route theo intent, độ mơ hồ, risk level
-- **Loop:** retrieval có thể chạy lại nếu evidence chưa đủ
-- **Quality gates:** kiểm tra grounding và citation trước khi trả lời
-- **Human-in-the-loop:** dùng interrupt/resume cho review
-- **Persistence:** checkpoint giúp resume sau khi dừng hoặc lỗi
+- `clarify-path`: thiếu dữ kiện quan trọng, cần hỏi ngược lại.
+- `human-review-path`: câu hỏi rủi ro cao, cần xác nhận phạm vi trả lời.
+- `unsupported-path`: ngoài phạm vi pháp luật mà hệ thống hỗ trợ.
+- `fast-path`: câu hỏi trực tiếp, low-risk, có thể trả lời nhanh.
+- `legal-agent-path`: pipeline đầy đủ cho câu hỏi pháp lý bình thường hoặc phức tạp.
 
----
+### 3.3 So sánh execution policy giữa fast-path và legal-agent-path
 
-## 4. AgentState đề xuất
+| Tiêu chí | Fast-path | Legal-agent-path |
+|---|---|---|
+| Mục tiêu | Trả lời nhanh câu hỏi đơn giản | Xử lý đầy đủ câu hỏi pháp lý phức tạp hoặc thông thường |
+| Route đầu vào | Low-risk, intent rõ, hỏi định nghĩa/điều luật trực tiếp | Câu hỏi cần reasoning đầy đủ hoặc evidence chưa chắc |
+| Rewrite query | Tối đa 2 query, gần câu gốc | Multi-query đầy đủ hơn |
+| Retrieve | `top_k_fast` nhỏ, article-first | Top-k lớn hơn, recall cao hơn |
+| Rerank | Mặc định bỏ CrossEncoder | Có thể dùng CrossEncoder đầy đủ |
+| Retrieval loop | Không loop dài, yếu thì escalate | Có retry retrieval |
+| Grounding | 1 lần check | Có revise / retrieve_again / human review |
+| Sources | 1-2 nguồn mạnh nhất | Nhiều nguồn hơn nếu cần |
+| Human review | Không ưu tiên dùng | Có thể kích hoạt khi risk cao hoặc grounding kém |
+
+## 4. Luồng chi tiết theo nhánh
+
+### 4.1 Fast-path
+
+```mermaid
+flowchart TD
+    A["fast-path"] --> B["rewrite_query_node<br/>execution_profile=fast"]
+    B --> C["retrieve_node<br/>top_k_fast, article_first_fast"]
+    C --> D["rerank_node<br/>mặc định skip CrossEncoder"]
+    D --> E["retrieval_check_node<br/>1 vòng"]
+
+    E -->|"retrieval_ok"| F["generate_draft_node<br/>fast answer ngắn"]
+    E -->|"escalate_to_full"| G["chuyển legal-agent-path"]
+
+    F --> H["grounding_check_node<br/>single pass"]
+    H -->|"proceed"| I["citation_format_node"]
+    H -->|"escalate_to_full"| G
+
+    G --> J["full legal pipeline"]
+    J --> I
+    I --> K["final_answer_node"]
+```
+
+Đặc điểm của fast-path hiện tại:
+
+- `execution_profile = "fast"` và `fast_path_enabled = true` được gắn từ `route_node`.
+- Rewrite query giới hạn tối đa 2 truy vấn.
+- Retrieval dùng cấu hình nhỏ hơn để ưu tiên precision thay vì recall.
+- Rerank mặc định sắp xếp theo `combined_score`, không dùng CrossEncoder ở cấu hình mặc định.
+- Grounding chỉ chạy 1 lần.
+- Nếu evidence yếu hoặc grounding không đạt, hệ thống **không loop dài** mà chuyển sang `legal-agent-path`.
+- Sau khi hoàn tất, số nguồn hiển thị được giới hạn gọn hơn.
+
+### 4.2 Legal-agent-path
+
+```mermaid
+flowchart TD
+    A["legal-agent-path"] --> B["rewrite_query_node<br/>execution_profile=full"]
+    B --> C["retrieve_node"]
+    C --> D["rerank_node<br/>có thể dùng CrossEncoder"]
+    D --> E["retrieval_check_node"]
+
+    E -->|"retry"| C
+    E -->|"proceed"| F["generate_draft_node"]
+    E -->|"fallback"| G["retrieval_fallback_node"]
+
+    F --> H["grounding_check_node"]
+
+    H -->|"proceed"| I["citation_format_node"]
+    H -->|"retrieve_again"| C
+    H -->|"revise"| J["revise_answer_node"]
+    H -->|"human_review"| K["waiting_user_input<br/>resume_kind=human_review"]
+
+    J --> H
+    G --> I
+    K -->|"user trả lời tiếp<br/>/chat/resume"| A
+    I --> L["final_answer_node"]
+```
+
+Đặc điểm của legal-agent-path hiện tại:
+
+- Chạy `execution_profile = "full"`.
+- Cho phép retrieval loop nếu evidence còn yếu.
+- Có thể revise lại câu trả lời nếu grounding chưa đạt.
+- Có thể chuyển sang `human review` nếu câu hỏi rủi ro cao hoặc cần xác nhận thêm.
+- Phù hợp với câu hỏi pháp lý thực tế, nhiều điều kiện hoặc có tác động đến quyết định pháp lý.
+
+### 4.3 Clarify và human-in-the-loop trong chat
+
+```mermaid
+flowchart TD
+    A["route/grounding phát hiện cần hỏi ngược lại"] --> B["status=waiting_user_input"]
+    B --> C["resume_kind=clarify | human_review"]
+    C --> D["resume_question hiển thị ngay trong chat"]
+
+    D --> E["User nhập tiếp trong ô chat"]
+    E --> F["Frontend tự gọi /chat/resume"]
+    F --> G["builder.resume(...)"]
+    G --> H["graph tiếp tục từ checkpoint"]
+```
+
+Hệ thống hiện dùng một schema thống nhất cho cả clarify và human review:
+
+```json
+{
+  "status": "waiting_user_input",
+  "resume_kind": "clarify | human_review",
+  "resume_question": "<câu assistant hỏi ngược lại>",
+  "thread_id": "thread-...",
+  "session_id": "session-..."
+}
+```
+
+Ý nghĩa:
+
+- **Clarify**: thiếu dữ kiện để truy xuất hoặc trả lời chính xác.
+- **Human review**: không phải thiếu dữ kiện, mà là cần xác nhận phạm vi trả lời ở câu hỏi rủi ro cao.
+
+Ví dụ:
+
+**Clarify**
+
+```json
+{
+  "status": "waiting_user_input",
+  "resume_kind": "clarify",
+  "resume_question": "Bạn muốn hỏi về hành vi vi phạm nào cụ thể?",
+  "thread_id": "thread-001",
+  "session_id": "session-001"
+}
+```
+
+**Human review**
+
+```json
+{
+  "status": "waiting_user_input",
+  "resume_kind": "human_review",
+  "resume_question": "Câu hỏi này có thể ảnh hưởng đến quyết định pháp lý thực tế. Bạn muốn hệ thống chỉ phân tích căn cứ pháp luật chung, hay tiếp tục theo tình huống cụ thể của bạn?",
+  "thread_id": "thread-002",
+  "session_id": "session-002"
+}
+```
+
+## 5. Logic route hiện tại
+
+`route_node` hiện quyết định theo thứ tự ưu tiên sau:
+
+1. Nếu câu hỏi thiếu dữ kiện quan trọng như `hành_vi_vi_pham`, `loai_tranh_chap`, `van_ban_phap_luat`, `tham_chieu_dieu_luat`, `chu_the` thì đi `clarify-path`.
+2. Nếu câu hỏi ngoài phạm vi pháp luật hỗ trợ thì đi `unsupported-path`.
+3. Nếu câu hỏi có rủi ro cao thì đi `human-review-path`.
+4. Nếu câu hỏi trực tiếp, low-risk, intent rõ thì đi `fast-path`.
+5. Các trường hợp còn lại đi `legal-agent-path`.
+
+Ví dụ:
+
+- `"Mức phạt là bao nhiêu?"` → `clarify-path`
+- `"Theo Luật Thanh niên, thanh niên là gì?"` → `fast-path`
+- `"Tôi có nên khởi kiện tranh chấp đất đai với hàng xóm không?"` → `human-review-path`
+
+## 6. AgentState và dữ liệu điều phối
+
+### 6.1 Các field chính trong AgentState
 
 ```python
-class AgentState(TypedDict):
+class AgentState(TypedDict, total=False):
     question: str
     normalized_question: str
     intent: str
-    intent_confidence: float
+    intent_score: float
     risk_level: str
-    need_clarify: bool
     rewritten_queries: list[str]
-    retrieved_docs: list[dict]
-    reranked_docs: list[dict]
-    retrieval_ok: bool
+    retrieved_docs: list[dict[str, Any]]
+    reranked_docs: list[dict[str, Any]]
+    context: str
+    sources: list[str]
     draft_answer: str
-    grounding_ok: bool
-    citations: list[dict]
     final_answer: str
-    review_required: bool
-    history: list
+    retrieval_ok: bool
+    grounding_ok: bool
+    need_clarify: bool
+    unsupported_query: bool
+    human_review_required: bool
+    review_note: str
+    route_reason: str
+    next_route: str
+    next_action: str
     loop_count: int
+    history: list[dict[str, Any]]
     thread_id: str
     session_id: str
+    interrupt_payload: dict[str, Any] | None
+    retrieval_debug: dict[str, Any]
+    citation_findings: dict[str, Any]
+    unsupported_claims: list[str]
+    missing_evidence: list[str]
+    grounding_score: float
+    reasoning_notes: dict[str, Any]
+    app_checkpoint_id: str
+    clarify_question: str
+    clarify_reason: str
+    risk_reason: str
+    top_intents: list[dict[str, Any]]
+    retrieval_failure_reason: str
+    response_status: str
+    status: str
+    draft_citations: list[str]
+    draft_confidence: float
+    review_response: str
+    clarify_response: str
 ```
 
----
+### 6.2 Các field điều phối đang dùng trong flow hiện tại
 
-## 5. Công nghệ sử dụng
+Ngoài `AgentState`, runtime hiện còn dùng thêm các field điều phối ở bước route/resume như:
 
-- **LangGraph**: điều phối workflow đa tác tử dạng đồ thị
-- **LangChain**: retriever, prompt, model wrapper
-- **Qdrant**: vector database chính, ANN retrieval, payload filtering, alias switching
-- **BM25**: keyword retrieval
-- **CrossEncoder**: reranking
-- **FastAPI**: backend API
-- **Streamlit**: giao diện người dùng
-- **RAGAS**: đánh giá chất lượng câu trả lời
+- `resume_kind`
+- `resume_question`
+- `missing_slots`
+- `execution_profile`
+- `fast_path_enabled`
 
----
+Các field này giúp frontend và graph biết:
 
-## 6. Cấu trúc thư mục đề xuất
+- có đang chờ người dùng nhập tiếp hay không,
+- câu hỏi ngược lại cần hiển thị là gì,
+- đang chạy fast-path hay legal-agent-path.
+
+## 7. API contract hiện tại
+
+### 7.1 `POST /chat`
+
+Trường hợp thành công bình thường:
+
+```json
+{
+  "status": "ok",
+  "final_answer": "...",
+  "sources": ["..."],
+  "route": "fast-path",
+  "risk_level": "low",
+  "thread_id": "thread-...",
+  "session_id": "session-..."
+}
+```
+
+Trường hợp chờ người dùng nhập tiếp:
+
+```json
+{
+  "status": "waiting_user_input",
+  "resume_kind": "clarify",
+  "resume_question": "Bạn muốn hỏi về hành vi vi phạm nào cụ thể?",
+  "route": "clarify-path",
+  "risk_level": "medium",
+  "thread_id": "thread-...",
+  "session_id": "session-..."
+}
+```
+
+### 7.2 `POST /chat/stream`
+
+SSE hiện stream các event chính:
+
+- `route`
+- `retrieval_status`
+- `partial_answer`
+- `grounding_status`
+- `clarify_required`
+- `review_required`
+- `final_state`
+
+Ví dụ event khi cần người dùng nhập tiếp:
+
+```text
+event: review_required
+data: {"status":"waiting_user_input","resume_kind":"human_review","resume_question":"...","thread_id":"...","session_id":"..."}
+```
+
+### 7.3 `POST /chat/resume`
+
+Frontend gọi API này khi người dùng đang ở trạng thái `waiting_user_input` và gửi tiếp một tin nhắn mới.
+
+Ví dụ clarify:
+
+```json
+{
+  "thread_id": "thread-001",
+  "session_id": "session-001",
+  "clarify_response": "Vượt đèn đỏ bằng xe máy"
+}
+```
+
+Ví dụ human review:
+
+```json
+{
+  "thread_id": "thread-002",
+  "session_id": "session-002",
+  "review_response": "Chỉ phân tích căn cứ pháp luật chung trước"
+}
+```
+
+## 8. Cấu trúc thư mục hiện tại
 
 ```text
 project_root/
 ├── README.md
 ├── requirements.txt
-├── .env.example
 ├── configs/
 │   ├── app.yaml
 │   ├── indexing.yaml
-│   ├── retrieval.yaml
 │   ├── prompts.yaml
+│   ├── retrieval.yaml
 │   └── routing.yaml
 ├── data/
-│   ├── raw/
-│   ├── processed/
-│   ├── chunks/
-│   └── manifests/
-│       └── legal_corpus_manifest.jsonl
+├── evaluation/
 ├── notebooks/
-│   ├── 01_eda_legal_corpus.ipynb
-│   ├── 02_embedding_benchmark.ipynb
-│   ├── 03_prompt_debug.ipynb
-│   └── 04_error_analysis.ipynb
 ├── src/
 │   ├── tv1_data/
-│   │   ├── ingest_bo_phap_dien.py
-│   │   ├── parse_clean.py
-│   │   ├── chunk_legal_docs.py
-│   │   └── sync_official_snapshot.py
 │   ├── tv2_index/
-│   │   ├── embedding_registry.py
-│   │   ├── build_qdrant_index.py
-│   │   ├── qdrant_manager.py
-│   │   ├── search_with_filters.py
-│   │   └── swap_active_collection.py
 │   ├── tv3_retrieval/
 │   │   ├── rewrite_query_node.py
 │   │   ├── retrieve_node.py
@@ -162,22 +395,22 @@ project_root/
 │   │   ├── retrieval_check_node.py
 │   │   └── fallback_policy.py
 │   ├── tv4_router/
-│   │   ├── intent_classifier.py
-│   │   ├── route_node.py
 │   │   ├── clarify_detector.py
-│   │   └── risk_tagger.py
+│   │   ├── intent_classifier.py
+│   │   ├── risk_tagger.py
+│   │   └── route_node.py
 │   ├── tv5_reasoning/
-│   │   ├── prompt_library.py
+│   │   ├── citation_critic.py
 │   │   ├── generate_draft_node.py
 │   │   ├── grounding_check_node.py
-│   │   ├── revise_answer_node.py
-│   │   └── citation_critic.py
+│   │   ├── prompt_library.py
+│   │   └── revise_answer_node.py
 │   ├── graph/
-│   │   ├── state.py
 │   │   ├── builder.py
-│   │   ├── subgraphs.py
+│   │   ├── checkpointing.py
 │   │   ├── human_review_node.py
-│   │   └── checkpointing.py
+│   │   ├── state.py
+│   │   └── subgraphs.py
 │   └── app/
 │       ├── api/
 │       │   ├── main.py
@@ -186,255 +419,84 @@ project_root/
 │       │       └── stream.py
 │       └── ui/
 │           └── streamlit_app.py
-├── evaluation/
-│   ├── eval_retrieval.py
-│   ├── eval_ragas.py
-│   └── eval_grounding.py
 └── tests/
-    ├── test_router.py
+    ├── test_graph_resume.py
     ├── test_retrieval_flow.py
-    └── test_graph_resume.py
+    └── test_router.py
 ```
 
----
+## 9. Cấu hình chính cho fast-path
 
-## 7. Quy ước triển khai: `.py` hay `.ipynb`?
+Một số cấu hình quan trọng hiện được dùng để làm fast-path nhẹ hơn:
 
-### Nên dùng `.py` cho phần lõi hệ thống
-Toàn bộ phần dưới đây nên viết bằng **Python modules (`.py`)**:
-
-- graph builder,
-- các node LangGraph,
-- ETL và data pipeline,
-- API FastAPI,
-- checkpointing,
-- evaluation scripts,
-- unit tests / integration tests.
-
-**Lý do:** dễ import, tái sử dụng, kiểm thử, Dockerize và triển khai thật.
-
-### Chỉ dùng `.ipynb` cho thí nghiệm
-Notebook nên dùng cho:
-
-- EDA dữ liệu,
-- benchmark embedding,
-- thử prompt,
-- phân tích lỗi retrieval/generation,
-- trực quan hóa confusion matrix, RAGAS, biểu đồ.
-
-**Không nên** đặt logic vận hành chính của hệ thống LangGraph vào notebook.
-
----
-
-## 8. Phân công thành viên và file chính
-
-### Phúc (TV1) — Data Engineer
-Các file chính và nhiệm vụ:
-- `ingest_bo_phap_dien.py` — nhập dữ liệu chính thức từ Bộ pháp điển điện tử, đọc HTML/tệp nguồn và lưu bản nguồn để xử lý tiếp.
-- `parse_clean.py` — bóc tách nội dung, loại bỏ nhiễu HTML, chuẩn hóa metadata như số hiệu, ngày ban hành, cơ quan ban hành, lĩnh vực.
-- `chunk_legal_docs.py` — chia văn bản theo Điều/Khoản/Điểm, tạo chunk và manifest phục vụ indexing.
-- `sync_official_snapshot.py` — phát hiện văn bản mới hoặc văn bản thay đổi và đồng bộ tăng dần mà không cần rebuild toàn bộ dữ liệu.
-
-### Dũng (TV2) — Embedding & Vector DB
-Các file chính và nhiệm vụ:
-- `embedding_registry.py` — quản lý embedding models, cấu hình encode và lựa chọn model active cho indexing/search.
-- `build_qdrant_index.py` — sinh embedding, tạo collection article-level hoặc chunk-level và nạp dữ liệu lên Qdrant.
-- `qdrant_manager.py` — tạo collection, thiết lập alias, quản lý lifecycle của index và chính sách cập nhật.
-- `search_with_filters.py` — thực hiện semantic search có lọc theo metadata như ngày ban hành, lĩnh vực, loại văn bản.
-- `swap_active_collection.py` — chuyển collection active sang index mới để cập nhật an toàn, hạn chế downtime.
-
-### Huy (TV3) — Retrieval Agent
-Các file chính và nhiệm vụ:
-- `rewrite_query_node.py` — viết lại câu hỏi theo hướng multi-query để tăng khả năng recall và bao phủ thuật ngữ pháp lý.
-- `retrieve_node.py` — thực hiện hybrid retrieval giữa BM25 và vector search từ Qdrant.
-- `rerank_node.py` — sắp xếp lại candidate bằng CrossEncoder để đưa các chứng cứ liên quan nhất lên đầu.
-- `retrieval_check_node.py` — đánh giá evidence đã đủ mạnh hay chưa dựa trên score, độ phủ và chất lượng nguồn.
-- `fallback_policy.py` — quyết định khi nào cần retry retrieval, tăng top-k, đổi query hoặc fallback sang nhánh an toàn hơn.
-
-### Cường (TV4) — Router + Frontend
-Các file chính và nhiệm vụ:
-- `intent_classifier.py` — phân loại intent và tính confidence score cho câu hỏi người dùng.
-- `route_node.py` — quyết định nhánh chạy tiếp theo của graph như clarify, fast path hay legal agent path.
-- `clarify_detector.py` — phát hiện câu hỏi mơ hồ, thiếu dữ kiện hoặc quá ngắn để yêu cầu người dùng làm rõ.
-- `risk_tagger.py` — gắn nhãn risk level cho các câu hỏi pháp lý nhạy cảm để kích hoạt nhánh kiểm soát phù hợp.
-- `streamlit_app.py` — xây dựng giao diện chat, hiển thị nguồn trích dẫn, trạng thái routing và lịch sử hội thoại.
-
-### Đại (TV5) — Legal Reasoning Agent
-Các file chính và nhiệm vụ:
-- `prompt_library.py` — quản lý prompt theo intent, mức độ rủi ro, loại bằng chứng và loại tác vụ sinh câu trả lời.
-- `generate_draft_node.py` — sinh bản nháp câu trả lời pháp lý từ evidence đã truy xuất.
-- `grounding_check_node.py` — kiểm tra từng claim trong câu trả lời có được evidence hỗ trợ hay không.
-- `revise_answer_node.py` — viết lại câu trả lời khi grounding chưa đạt hoặc cần làm rõ hơn căn cứ pháp lý.
-- `citation_critic.py` — kiểm tra chất lượng citation, định dạng trích dẫn và phát hiện citation sai hoặc thiếu.
-
-### Dương (TV6) — LangGraph Orchestration + FastAPI
-Các file chính và nhiệm vụ:
-- `state.py` — định nghĩa `AgentState` và các trường dữ liệu dùng chung cho toàn bộ graph.
-- `builder.py` — lắp ghép graph, khai báo node, edge, routing và các loop kiểm tra chất lượng.
-- `subgraphs.py` — đóng gói các subgraph có thể tái sử dụng như legal path hoặc review path.
-- `human_review_node.py` — triển khai interrupt/resume cho human review trong các trường hợp nhạy cảm hoặc độ tin cậy thấp.
-- `checkpointing.py` — lưu checkpoint và khôi phục graph theo `thread_id/session_id`.
-- `main.py`, `chat.py`, `stream.py` — cung cấp backend API cho chế độ đồng bộ và streaming.
-
----
-
-## 9. Cài đặt nhanh
-
-### 9.1 Clone repo
-
-```bash
-git clone <YOUR_REPO_URL>
-cd <YOUR_REPO_NAME>
+```yaml
+fast_path_enabled: true
+article_first_fast: true
+top_k_fast: 3
+bm25_top_k_fast: 3
+vector_top_k_fast: 3
+rerank_top_n_fast: 2
+enable_rerank_fast: false
+max_fast_retries: 0
+fast_grounding_single_pass: true
+fast_sources_limit: 2
+max_queries_fast: 2
 ```
 
-### 9.2 Tạo môi trường
+Ý nghĩa:
 
-```bash
-python -m venv .venv
-source .venv/bin/activate
-```
-
-Windows PowerShell:
-
-```powershell
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-```
-
-### 9.3 Cài dependencies
-
-```bash
-pip install -r requirements.txt
-```
-
-### 9.4 Tạo file môi trường
-
-```bash
-cp .env.example .env
-```
-
-Điền các biến môi trường cần thiết như:
-
-- `QDRANT_URL`
-- `QDRANT_API_KEY` (nếu có)
-- `OLLAMA_BASE_URL`
-- `OPENAI_API_KEY` (nếu dùng model cloud)
-- `LANGCHAIN_TRACING_V2`
-- `LANGCHAIN_API_KEY`
-
----
+- fast-path ưu tiên độ trễ thấp,
+- dùng ít truy vấn hơn,
+- dùng ít nguồn hơn,
+- không chạy revise loop,
+- evidence yếu thì chuyển sang full path thay vì cố tự sửa nhiều vòng.
 
 ## 10. Cách chạy hệ thống
 
-### 10.1 Chạy pipeline dữ liệu
+### 10.1 Cài dependencies
 
-```bash
-python -m src.tv1_data.ingest_bo_phap_dien
-python -m src.tv1_data.parse_clean
-python -m src.tv1_data.chunk_legal_docs
+```powershell
+pip install -r requirements.txt
 ```
 
-### 10.2 Build index
+### 10.2 Chạy backend FastAPI
 
-```bash
-python -m src.tv2_index.build_qdrant_index
+```powershell
+python -m uvicorn src.app.api.main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-### 10.3 Chạy API
+### 10.3 Chạy Streamlit UI
 
-```bash
-uvicorn src.app.api.main:app --reload
-```
-
-### 10.4 Chạy Streamlit
-
-```bash
+```powershell
 streamlit run src/app/ui/streamlit_app.py
 ```
 
----
+### 10.4 Chạy test chính
 
-## 11. Đánh giá
-
-### Retrieval
-- Precision@5
-- Recall@5
-- MRR
-
-### Intent / Routing
-- Accuracy
-- Macro F1
-- F1 theo lớp
-- Clarify trigger accuracy
-- Human review escalation accuracy
-
-### Generation / Grounding
-- Faithfulness
-- Answer Relevancy
-- Context Recall
-- Context Precision
-- Grounded answer rate
-- Unsupported claim rate
-- Citation correctness rate
-
-### System
-- E2E latency p50 / p95
-- Retry success rate
-- Interrupt-resume latency
-- Throughput
-- Uptime
-
----
-
-## 12. Test
-
-```bash
-pytest tests/
+```powershell
+python -m pytest tests/test_graph_resume.py -v
+python -m pytest tests/test_retrieval_flow.py -q
+python -m pytest tests/test_router.py -q
 ```
 
-Test chính:
+## 11. Kết quả kiến trúc sau khi cập nhật
 
-- `test_router.py`
-- `test_retrieval_flow.py`
-- `test_graph_resume.py`
+Sau khi refactor, hệ thống đã đạt các thay đổi chính sau:
 
----
+- `fast-path` không còn là nhãn route giả mà là một nhánh xử lý thật sự nhẹ hơn.
+- `clarify` và `human review` được thống nhất về schema `waiting_user_input`.
+- Frontend hiển thị `resume_question` ngay trong khung chat và tự dùng `/chat/resume` cho tin nhắn tiếp theo.
+- Streaming SSE bám đúng event backend và giữ được `event_trace`.
+- Checkpoint/resume tiếp tục đúng theo `thread_id` và `session_id`.
 
-## 13. Hướng phát triển tiếp theo
+## 12. Kết luận
 
-- mở rộng toàn bộ corpus pháp luật Việt Nam,
-- tăng cường metadata pháp lý và thời điểm hiệu lực,
-- thêm OCR/PDF pipeline,
-- nâng cấp legal critic / legal verifier,
-- triển khai cloud + autoscaling,
-- bổ sung evaluation với chuyên gia pháp lý.
+Kiến trúc hiện tại đã chuyển từ một pipeline RAG tuyến tính sang một hệ thống agentic có điều phối rõ ràng, tách execution policy theo mức độ phức tạp của câu hỏi và có cơ chế tương tác hai chiều với người dùng trong hội thoại. Đây là điểm khác biệt quan trọng của phiên bản hiện tại so với thiết kế ban đầu.
 
----
+Các điểm cốt lõi của phiên bản hiện tại là:
 
-## 14. Ghi chú học thuật
-
-Dự án hướng tới việc chứng minh rằng bài toán hỏi đáp pháp luật **phù hợp với LangGraph hơn chain tuyến tính đơn thuần**, vì hệ thống cần:
-
-- state phức tạp,
-- routing động,
-- retry loop,
-- quality gates,
-- human-in-the-loop,
-- persistence và resume.
-
----
-
-## 15. Nhóm thực hiện
-
-- **Phúc** — TV1 Data Engineer
-- **Dũng** — TV2 Embedding & Vector DB
-- **Huy** — TV3 Retrieval Agent
-- **Cường** — TV4 Intent Classifier + Frontend
-- **Đại** — TV5 Legal Reasoning Agent
-- **Dương** — TV6 LangGraph Orchestration + FastAPI
-
----
-
-## 16. License
-
-Phục vụ mục đích học tập và nghiên cứu nội bộ.
+- route chính xác hơn giữa `clarify`, `fast-path`, `full legal path` và `human review`,
+- execution policy của fast-path nhẹ hơn thật sự,
+- hỗ trợ `waiting_user_input` ngay trong chat,
+- giữ được resume theo checkpoint,
+- phù hợp để mở rộng tiếp cho đánh giá, logging và triển khai thực tế.

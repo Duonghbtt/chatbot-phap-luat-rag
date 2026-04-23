@@ -1,0 +1,83 @@
+intent_labels:
+  - hoi_dinh_nghia
+  - hoi_muc_phat
+  - hoi_thu_tuc_hanh_chinh
+  - hoi_so_sanh_luat
+  - hoi_tinh_huong_thuc_te
+
+confidence_threshold: 0.55
+clarify_min_length: 12
+
+unsupported_patterns:
+  - thời tiết
+  - bóng đá
+  - chứng khoán
+  - lập trình
+  - du lịch
+  - nấu ăn
+  - giải trí
+
+high_risk_patterns:
+  - khởi kiện
+  - tranh chấp
+  - tố tụng
+  - khiếu nại
+  - tố cáo
+  - bồi thường
+  - bắt giam
+  - đi tù
+  - thu hồi đất
+  - ly hôn
+  - thừa kế
+  - sa thải
+
+fast_path_patterns:
+  - là gì
+  - khái niệm
+  - định nghĩa
+  - giải thích từ ngữ
+  - ai có trách nhiệm
+  - ai được
+  - đối tượng nào
+  - theo luật
+  - theo điều
+
+route_policy_flags:
+  enable_fast_path: true
+  prefer_human_review_for_high_risk: true
+
+model_type: rule_based
+model_path: ""
+
+rule_keywords:
+  hoi_dinh_nghia:
+    - là gì
+    - khái niệm
+    - định nghĩa
+    - giải thích từ ngữ
+    - hiểu thế nào
+  hoi_muc_phat:
+    - mức phạt
+    - phạt bao nhiêu
+    - xử phạt
+    - bị phạt
+    - chế tài
+  hoi_thu_tuc_hanh_chinh:
+    - thủ tục
+    - hồ sơ
+    - trình tự
+    - đăng ký
+    - xin cấp
+    - cách thực hiện
+  hoi_so_sanh_luat:
+    - khác nhau
+    - so sánh
+    - phân biệt
+    - giống nhau
+  hoi_tinh_huong_thuc_te:
+    - nếu
+    - trường hợp
+    - tôi
+    - gia đình
+    - có bị
+    - phải làm sao

@@ -9,6 +9,9 @@ env/
 
 # Python cache
 __pycache__/
+.checkpoints/
+.pytest_tmp/
+.tmp_pytest/
 .pytest_cache/
 pytest-cache-files-*/
 *.pyc
