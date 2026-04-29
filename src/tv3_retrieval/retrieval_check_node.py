@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import os
+from functools import wraps
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -12,6 +14,41 @@ from src.tv3_retrieval.fallback_policy import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+try:
+    from langsmith import traceable as _langsmith_traceable
+except Exception:  # pragma: no cover - optional dependency.
+    _langsmith_traceable = None
+
+
+def _langsmith_tracing_enabled() -> bool:
+    tracing_flag = str(os.getenv("LANGSMITH_TRACING") or "").strip().lower() in {"1", "true", "yes", "on"}
+    api_key = str(os.getenv("LANGSMITH_API_KEY") or "").strip()
+    return tracing_flag and bool(api_key)
+
+
+def _optional_traceable(*, name: str, run_type: str = "chain", tags: list[str] | None = None):
+    def decorator(func):
+        if _langsmith_traceable is None:
+            @wraps(func)
+            def no_trace(*args, **kwargs):
+                kwargs.pop("langsmith_extra", None)
+                return func(*args, **kwargs)
+
+            return no_trace
+
+        traced_func = _langsmith_traceable(name=name, run_type=run_type, tags=list(tags or []))(func)
+
+        @wraps(func)
+        def wrapped(*args, **kwargs):
+            if not _langsmith_tracing_enabled():
+                kwargs.pop("langsmith_extra", None)
+                return func(*args, **kwargs)
+            return traced_func(*args, **kwargs)
+
+        return wrapped
+
+    return decorator
 
 
 def _is_structured_legal_doc(doc: Mapping[str, Any]) -> bool:
@@ -94,6 +131,7 @@ def evaluate_evidence(
     }
 
 
+@_optional_traceable(name="tv3.retrieval_check_node", run_type="chain", tags=["tv3", "retrieval"])
 def retrieval_check_node(
     state: Mapping[str, Any],
     *,
@@ -136,7 +174,10 @@ def retrieval_check_node(
             "retrieval_debug": previous_debug,
         }
 
-    decision = decide_next_retrieval_step(state, resolved_retrieval_config)
+    decision_state = dict(state)
+    decision_state["retrieval_failure_reason"] = evidence["failure_reason"]
+    decision_state["retrieval_debug"] = previous_debug
+    decision = decide_next_retrieval_step(decision_state, resolved_retrieval_config)
     strategy = decision.get("strategy", "")
     retry_plan = decision.get("retry_plan")
     strategies_tried = list(previous_debug.get("strategies_tried") or [])

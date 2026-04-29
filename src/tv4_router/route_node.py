@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
+from functools import wraps
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -15,6 +17,41 @@ from src.tv4_router.intent_classifier import (
 from src.tv4_router.risk_tagger import tag_risk
 
 LOGGER = logging.getLogger(__name__)
+
+try:
+    from langsmith import traceable as _langsmith_traceable
+except Exception:  # pragma: no cover - optional dependency.
+    _langsmith_traceable = None
+
+
+def _langsmith_tracing_enabled() -> bool:
+    tracing_flag = str(os.getenv("LANGSMITH_TRACING") or "").strip().lower() in {"1", "true", "yes", "on"}
+    api_key = str(os.getenv("LANGSMITH_API_KEY") or "").strip()
+    return tracing_flag and bool(api_key)
+
+
+def _optional_traceable(*, name: str, run_type: str = "chain", tags: list[str] | None = None):
+    def decorator(func):
+        if _langsmith_traceable is None:
+            @wraps(func)
+            def no_trace(*args, **kwargs):
+                kwargs.pop("langsmith_extra", None)
+                return func(*args, **kwargs)
+
+            return no_trace
+
+        traced_func = _langsmith_traceable(name=name, run_type=run_type, tags=list(tags or []))(func)
+
+        @wraps(func)
+        def wrapped(*args, **kwargs):
+            if not _langsmith_tracing_enabled():
+                kwargs.pop("langsmith_extra", None)
+                return func(*args, **kwargs)
+            return traced_func(*args, **kwargs)
+
+        return wrapped
+
+    return decorator
 
 HUMAN_REVIEW_QUESTIONS = [
     "Câu hỏi này có thể ảnh hưởng đến quyết định pháp lý thực tế. Bạn muốn hệ thống chỉ phân tích căn cứ pháp luật chung, hay tiếp tục theo tình huống cụ thể của bạn?",
@@ -131,6 +168,7 @@ def _is_local_high_risk(question: str) -> bool:
     return any(token in normalized for token in HIGH_RISK_HINTS)
 
 
+@_optional_traceable(name="tv4.route_node", run_type="chain", tags=["tv4", "routing"])
 def route_node(
     state: Mapping[str, Any],
     *,

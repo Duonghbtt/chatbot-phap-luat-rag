@@ -3,9 +3,11 @@ from __future__ import annotations
 import hashlib
 import logging
 import math
+import os
 import re
 from collections import Counter
 from dataclasses import dataclass
+from functools import wraps
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -20,6 +22,40 @@ from src.tv3_retrieval.fallback_policy import (
 )
 
 LOGGER = logging.getLogger(__name__)
+try:
+    from langsmith import traceable as _langsmith_traceable
+except Exception:  # pragma: no cover - optional dependency.
+    _langsmith_traceable = None
+
+
+def _langsmith_tracing_enabled() -> bool:
+    tracing_flag = str(os.getenv("LANGSMITH_TRACING") or "").strip().lower() in {"1", "true", "yes", "on"}
+    api_key = str(os.getenv("LANGSMITH_API_KEY") or "").strip()
+    return tracing_flag and bool(api_key)
+
+
+def _optional_traceable(*, name: str, run_type: str = "chain", tags: list[str] | None = None):
+    def decorator(func):
+        if _langsmith_traceable is None:
+            @wraps(func)
+            def no_trace(*args, **kwargs):
+                kwargs.pop("langsmith_extra", None)
+                return func(*args, **kwargs)
+
+            return no_trace
+
+        traced_func = _langsmith_traceable(name=name, run_type=run_type, tags=list(tags or []))(func)
+
+        @wraps(func)
+        def wrapped(*args, **kwargs):
+            if not _langsmith_tracing_enabled():
+                kwargs.pop("langsmith_extra", None)
+                return func(*args, **kwargs)
+            return traced_func(*args, **kwargs)
+
+        return wrapped
+
+    return decorator
 TOKEN_PATTERN = re.compile(r"[0-9A-Za-zÀ-ỹ]+")
 _BM25_CACHE: dict[tuple[str, str, float, float], "LocalBM25Retriever"] = {}
 _CORPUS_CACHE: dict[tuple[str, str], list[dict[str, Any]]] = {}
@@ -57,6 +93,20 @@ def _dedup_key(document: Mapping[str, Any]) -> str:
     return _hash_content(str(document.get("content") or ""))
 
 
+def _coerce_mapping_row(row: Any, *, source_name: str, logger: logging.Logger | None = None) -> dict[str, Any] | None:
+    if isinstance(row, Mapping):
+        return dict(row)
+    if row is None:
+        (logger or LOGGER).warning("Skipping null retrieval row from %s.", source_name)
+        return None
+    (logger or LOGGER).warning(
+        "Skipping malformed retrieval row from %s: expected mapping, got %s.",
+        source_name,
+        type(row).__name__,
+    )
+    return None
+
+
 @dataclass(slots=True)
 class BM25Document:
     retrieval_text: str
@@ -74,7 +124,10 @@ class LocalBM25Retriever:
         self.term_freqs: list[Counter[str]] = []
         self.doc_lengths: list[int] = []
 
-        for row in docs:
+        for raw_row in docs:
+            row = _coerce_mapping_row(raw_row, source_name="bm25_corpus")
+            if row is None:
+                continue
             retrieval_text = str(row.get("retrieval_text") or row.get("content") or "").strip()
             content = str(row.get("content") or "").strip()
             metadata = dict(row.get("metadata") or {})
@@ -295,7 +348,10 @@ def _vector_search(
         raise ValueError(f"Unsupported retrieval level: {level}")
 
     normalized_results: list[dict[str, Any]] = []
-    for row in raw_results or []:
+    for raw_row in raw_results or []:
+        row = _coerce_mapping_row(raw_row, source_name="vector_search")
+        if row is None:
+            continue
         normalized_results.append(
             {
                 "content": str(row.get("content") or "").strip(),
@@ -352,7 +408,10 @@ def merge_hybrid_results(
     for trace in query_traces:
         query_text = str(trace.get("query") or "")
         for source_name, rows in (("bm25", trace.get("bm25", [])), ("vector", trace.get("vector", []))):
-            for row in rows or []:
+            for raw_row in rows or []:
+                row = _coerce_mapping_row(raw_row, source_name=source_name)
+                if row is None:
+                    continue
                 key = _dedup_key(row)
                 payload = merged.setdefault(
                     key,
@@ -425,7 +484,7 @@ def merge_hybrid_results(
     )
     return merged_docs
 
-
+@_optional_traceable(name="tv3.retrieve_node", run_type="chain", tags=["tv3", "retrieval"])
 def retrieve_node(
     state: Mapping[str, Any],
     *,

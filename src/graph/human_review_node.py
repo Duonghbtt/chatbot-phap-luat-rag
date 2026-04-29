@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import os
+from functools import wraps
 from typing import Any, Mapping
 
 from langgraph.types import interrupt
@@ -8,6 +10,41 @@ from langgraph.types import interrupt
 from src.graph.state import append_history
 
 LOGGER = logging.getLogger(__name__)
+
+try:
+    from langsmith import traceable as _langsmith_traceable
+except Exception:  # pragma: no cover - optional dependency.
+    _langsmith_traceable = None
+
+
+def _langsmith_tracing_enabled() -> bool:
+    tracing_flag = str(os.getenv("LANGSMITH_TRACING") or "").strip().lower() in {"1", "true", "yes", "on"}
+    api_key = str(os.getenv("LANGSMITH_API_KEY") or "").strip()
+    return tracing_flag and bool(api_key)
+
+
+def _optional_traceable(*, name: str, run_type: str = "chain", tags: list[str] | None = None):
+    def decorator(func):
+        if _langsmith_traceable is None:
+            @wraps(func)
+            def no_trace(*args, **kwargs):
+                kwargs.pop("langsmith_extra", None)
+                return func(*args, **kwargs)
+
+            return no_trace
+
+        traced_func = _langsmith_traceable(name=name, run_type=run_type, tags=list(tags or []))(func)
+
+        @wraps(func)
+        def wrapped(*args, **kwargs):
+            if not _langsmith_tracing_enabled():
+                kwargs.pop("langsmith_extra", None)
+                return func(*args, **kwargs)
+            return traced_func(*args, **kwargs)
+
+        return wrapped
+
+    return decorator
 
 _POSITIVE_TOKENS = {"đồng ý", "duyệt", "ok", "tiếp tục", "approve", "yes", "được"}
 _NEGATIVE_TOKENS = {"không", "từ chối", "stop", "dừng", "reject", "no"}
@@ -72,6 +109,8 @@ def _apply_review_response(state: Mapping[str, Any], response_text: str, *, stag
             "next_action": "resume_legal_agent",
             "response_status": "",
             "status": "",
+            "resume_kind": "",
+            "resume_question": "",
             "review_note": f"Đã nhận phản hồi human review: {response_text}",
             "history": history,
         }
@@ -93,11 +132,14 @@ def _apply_review_response(state: Mapping[str, Any], response_text: str, *, stag
         "next_action": "proceed",
         "response_status": "",
         "status": "",
+        "resume_kind": "",
+        "resume_question": "",
         "review_note": f"Đã nhận phản hồi human review: {response_text}",
         "history": history,
     }
 
 
+@_optional_traceable(name="tv6.human_review_node", run_type="chain", tags=["tv6", "review"])
 def human_review_node(state: Mapping[str, Any]) -> dict[str, Any]:
     """Pause for human review or apply a human-review resume payload."""
 
@@ -125,6 +167,7 @@ def human_review_node(state: Mapping[str, Any]) -> dict[str, Any]:
     return _apply_review_response(state, review_response, stage=stage)
 
 
+@_optional_traceable(name="tv6.manual_human_review_node", run_type="chain", tags=["tv6", "review"])
 def manual_human_review_node(state: Mapping[str, Any]) -> dict[str, Any]:
     """Manual-runtime equivalent of the human-review node without LangGraph interrupt."""
 

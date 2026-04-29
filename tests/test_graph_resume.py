@@ -251,6 +251,8 @@ def _build_pre_review_dependencies(trace: dict[str, int]) -> GraphDependencies:
                 "next_action": "resume_legal_agent",
                 "response_status": "",
                 "status": "",
+                "resume_kind": "",
+                "resume_question": "",
                 "review_note": f"Đã nhận phản hồi human review: {review_response}",
             }
         return {
@@ -312,7 +314,7 @@ def test_interrupt_when_human_review_required() -> None:
         session_id="session-review-001",
     )
 
-    assert state["response_status"] == "review_required"
+    assert state["response_status"] == "waiting_user_input"
     assert state["interrupt_payload"] is not None
     assert state["interrupt_payload"]["kind"] == "human_review"
     assert state["interrupt_payload"]["stage"] == "post_reasoning"
@@ -321,7 +323,9 @@ def test_interrupt_when_human_review_required() -> None:
     assert state["review_note"] == "Cần chuyên viên pháp lý xác nhận trước khi phát hành câu trả lời."
     assert state["draft_answer"]
     assert state["human_review_required"] is True
-    assert state["status"] == "review_required"
+    assert state["status"] == "waiting_user_input"
+    assert state["resume_kind"] == "human_review"
+    assert state["resume_question"]
     assert store.exists(thread_id="thread-review-001", session_id="session-review-001") is True
 
 
@@ -343,7 +347,10 @@ def test_checkpoint_saved_before_resume() -> None:
     assert saved["next_route"] == "legal-agent-path"
     assert saved["interrupt_payload"]["kind"] == "human_review"
     assert saved["interrupt_payload"]["stage"] == "post_reasoning"
-    assert saved["response_status"] == "review_required"
+    assert saved["response_status"] == "waiting_user_input"
+    assert saved["status"] == "waiting_user_input"
+    assert saved["resume_kind"] == "human_review"
+    assert saved["resume_question"]
     assert saved["loop_count"] == 0
     assert isinstance(saved["history"], list)
 
@@ -367,6 +374,9 @@ def test_resume_from_checkpoint_success() -> None:
     assert resumed["interrupt_payload"] is None
     assert resumed["human_review_required"] is False
     assert resumed["response_status"] == "ok"
+    assert resumed["status"] == "ok"
+    assert resumed["resume_kind"] == ""
+    assert resumed["resume_question"] == ""
     assert resumed["final_answer"]
     assert "Điều 36.3.LQ.10." in resumed["final_answer"]
     assert "Đồng ý phát hành câu trả lời này." in resumed["review_note"]
@@ -459,7 +469,7 @@ def test_resume_updates_final_answer_after_review() -> None:
         review_response="Đồng ý cho hệ thống tiếp tục xử lý và phát hành câu trả lời.",
     )
 
-    assert interrupted["response_status"] == "review_required"
+    assert interrupted["response_status"] == "waiting_user_input"
     assert interrupted["interrupt_payload"]["stage"] == "pre_retrieval"
     assert resumed["response_status"] == "ok"
     assert "Đồng ý cho hệ thống tiếp tục xử lý" in resumed["final_answer"]

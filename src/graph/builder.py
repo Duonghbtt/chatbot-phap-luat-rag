@@ -7,6 +7,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass
+from functools import wraps
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
 
@@ -38,6 +39,64 @@ LOGGER = logging.getLogger(__name__)
 DEFAULT_APP_CONFIG_PATH = Path("configs/app.yaml")
 ENV_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)(?::([^}]*))?\}")
 WAITING_USER_INPUT_STATUS = "waiting_user_input"
+
+try:
+    from langsmith import traceable as _langsmith_traceable
+except Exception:  # pragma: no cover - optional dependency.
+    _langsmith_traceable = None
+
+
+def _langsmith_tracing_enabled() -> bool:
+    tracing_flag = str(os.getenv("LANGSMITH_TRACING") or "").strip().lower() in {"1", "true", "yes", "on"}
+    api_key = str(os.getenv("LANGSMITH_API_KEY") or "").strip()
+    return tracing_flag and bool(api_key)
+
+
+def _optional_traceable(*, name: str, run_type: str = "chain", tags: list[str] | None = None):
+    def decorator(func):
+        if _langsmith_traceable is None:
+            @wraps(func)
+            def no_trace(*args, **kwargs):
+                kwargs.pop("langsmith_extra", None)
+                return func(*args, **kwargs)
+
+            return no_trace
+
+        traced_func = _langsmith_traceable(name=name, run_type=run_type, tags=list(tags or []))(func)
+
+        @wraps(func)
+        def wrapped(*args, **kwargs):
+            if not _langsmith_tracing_enabled():
+                kwargs.pop("langsmith_extra", None)
+                return func(*args, **kwargs)
+            return traced_func(*args, **kwargs)
+
+        return wrapped
+
+    return decorator
+
+
+def _truncate_preview(value: str, *, max_chars: int = 240) -> str:
+    text = normalize_user_text(value)
+    return text[:max_chars].strip()
+
+
+NODE_TRACE_TAGS: dict[str, list[str]] = {
+    "analyze_node": ["tv6", "orchestration"],
+    "route_node": ["tv4", "routing"],
+    "clarify_node": ["tv6", "orchestration"],
+    "manual_clarify_node": ["tv6", "orchestration"],
+    "unsupported_node": ["tv6", "orchestration"],
+    "retrieve_node": ["tv3", "retrieval"],
+    "rerank_node": ["tv3", "retrieval"],
+    "retrieval_check_node": ["tv3", "retrieval"],
+    "generate_draft_node": ["tv5", "reasoning"],
+    "grounding_check_node": ["tv5", "reasoning"],
+    "revise_answer_node": ["tv5", "reasoning"],
+    "human_review_node": ["tv6", "review"],
+    "citation_format_node": ["tv6", "orchestration"],
+    "final_answer_node": ["tv6", "orchestration"],
+}
 
 
 @dataclass(slots=True, frozen=True)
@@ -115,6 +174,7 @@ def load_app_config(config_path: str | Path | None = None) -> AppConfig:
     )
 
 
+@_optional_traceable(name="tv6.analyze_node", run_type="chain", tags=["tv6", "orchestration"])
 def analyze_node(state: Mapping[str, Any]) -> dict[str, Any]:
     """Initialize and normalize the top-level graph state for one question."""
 
@@ -262,6 +322,7 @@ def _apply_clarify_response(state: Mapping[str, Any], clarify_response: str) -> 
     }
 
 
+@_optional_traceable(name="tv6.clarify_node", run_type="chain", tags=["tv6", "orchestration"])
 def clarify_node(state: Mapping[str, Any]) -> dict[str, Any]:
     """Pause the graph for clarification or apply a clarification response."""
 
@@ -287,6 +348,7 @@ def clarify_node(state: Mapping[str, Any]) -> dict[str, Any]:
     return clarify_node(merge_state(state, {"clarify_response": clarify_response}))
 
 
+@_optional_traceable(name="tv6.manual_clarify_node", run_type="chain", tags=["tv6", "orchestration"])
 def manual_clarify_node(state: Mapping[str, Any]) -> dict[str, Any]:
     """Manual-runtime equivalent of the clarify node without LangGraph interrupt."""
 
@@ -305,6 +367,7 @@ def manual_clarify_node(state: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+@_optional_traceable(name="tv6.unsupported_node", run_type="chain", tags=["tv6", "orchestration"])
 def unsupported_node(state: Mapping[str, Any]) -> dict[str, Any]:
     """Build a safe response for unsupported/out-of-scope queries."""
 
@@ -320,6 +383,7 @@ def unsupported_node(state: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+@_optional_traceable(name="tv6.retrieval_fallback_node", run_type="chain", tags=["tv6", "orchestration"])
 def retrieval_fallback_node(state: Mapping[str, Any]) -> dict[str, Any]:
     """Return a safe fallback answer when retrieval cannot find enough evidence."""
 
@@ -348,6 +412,7 @@ def retrieval_fallback_node(state: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+@_optional_traceable(name="tv6.citation_format_node", run_type="chain", tags=["tv6", "orchestration"])
 def citation_format_node(state: Mapping[str, Any]) -> dict[str, Any]:
     """Normalize citation display without changing the legal substance of the answer."""
 
@@ -380,6 +445,7 @@ def citation_format_node(state: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+@_optional_traceable(name="tv6.final_answer_node", run_type="chain", tags=["tv6", "orchestration"])
 def final_answer_node(state: Mapping[str, Any]) -> dict[str, Any]:
     """Finalize the answer payload and ensure a safe response always exists."""
 
@@ -441,12 +507,72 @@ class LegalQAGraphRuntime:
         self.compiled_graph = compiled_graph
         self.logger = logger or LOGGER
 
+    def _build_trace_metadata(self, state: Mapping[str, Any], **extra: Any) -> dict[str, Any]:
+        metadata = {
+            "route": str(state.get("next_route") or ""),
+            "risk_level": str(state.get("risk_level") or ""),
+            "thread_id": str(state.get("thread_id") or ""),
+            "session_id": str(state.get("session_id") or ""),
+            "loop_count": int(state.get("loop_count") or 0),
+            "status": str(state.get("response_status") or state.get("status") or ""),
+            "resume_kind": str(state.get("resume_kind") or ""),
+            "execution_profile": str(state.get("execution_profile") or ""),
+        }
+        question = str(state.get("normalized_question") or state.get("question") or "").strip()
+        if question:
+            metadata["question_preview"] = _truncate_preview(question)
+        for key, value in extra.items():
+            if value not in (None, "", [], {}):
+                metadata[str(key)] = value
+        return metadata
+
+    def _call_node(
+        self,
+        node_name: str,
+        node_callable: Callable[..., dict[str, Any]],
+        state: Mapping[str, Any],
+        *,
+        extra_metadata: Mapping[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        metadata = self._build_trace_metadata(state, node=node_name, **dict(extra_metadata or {}))
+        langsmith_extra = {
+            "metadata": metadata,
+            "tags": list(NODE_TRACE_TAGS.get(node_name, ["tv6", "orchestration"])),
+        }
+        try:
+            updates = node_callable(state, **kwargs, langsmith_extra=langsmith_extra)
+        except TypeError as exc:
+            if "langsmith_extra" not in str(exc):
+                raise
+            updates = node_callable(state, **kwargs)
+        if updates is None:
+            raise TypeError(f"Node `{node_name}` returned None; expected a state update mapping.")
+        if not isinstance(updates, Mapping):
+            raise TypeError(
+                f"Node `{node_name}` returned {type(updates).__name__}; expected a state update mapping."
+            )
+        return dict(updates)
+
+    @_optional_traceable(name="tv6.manual_human_review_step", run_type="chain", tags=["tv6", "review"])
     def _manual_human_review_step(self, state: Mapping[str, Any]) -> dict[str, Any]:
         review_handler = self.dependencies.human_review_node
+        interrupt_payload = dict(state.get("interrupt_payload") or {})
+        review_stage = str(interrupt_payload.get("stage") or "")
         if review_handler is human_review_node:
-            updates = manual_human_review_node(state)
+            updates = self._call_node(
+                "human_review_node",
+                manual_human_review_node,
+                state,
+                extra_metadata={"review_stage": review_stage},
+            )
         else:
-            updates = review_handler(state)
+            updates = self._call_node(
+                "human_review_node",
+                review_handler,
+                state,
+                extra_metadata={"review_stage": review_stage},
+            )
 
         if not updates:
             return {}
@@ -514,6 +640,12 @@ class LegalQAGraphRuntime:
         return updated_state
 
     def _apply(self, state: Mapping[str, Any], updates: Mapping[str, Any] | None) -> AgentState:
+        if updates is None:
+            raise TypeError("Attempted to merge a None state update into AgentState.")
+        if not isinstance(updates, Mapping):
+            raise TypeError(
+                f"Attempted to merge state updates of type {type(updates).__name__}; expected a mapping."
+            )
         return merge_state(state, updates)
 
     def _emit(self, emitter: Callable[[dict[str, Any]], None] | None, event: str, **payload: Any) -> None:
@@ -660,6 +792,7 @@ class LegalQAGraphRuntime:
         )
         return prepared_state
 
+    @_optional_traceable(name="tv6.run_retrieval_cycle", run_type="chain", tags=["tv6", "orchestration", "retrieval"])
     def _run_retrieval_cycle(
         self,
         state: AgentState,
@@ -672,13 +805,37 @@ class LegalQAGraphRuntime:
         while retrieval_rounds < round_limit:
             retrieval_rounds += 1
             started_at = time.perf_counter()
-            state = self._apply(state, self.dependencies.retrieve_node(state))
+            state = self._apply(
+                state,
+                self._call_node(
+                    "retrieve_node",
+                    self.dependencies.retrieve_node,
+                    state,
+                    extra_metadata={"retrieval_round": retrieval_rounds},
+                ),
+            )
             state = self._log_step("retrieve_node", started_at, state, round=retrieval_rounds)
             started_at = time.perf_counter()
-            state = self._apply(state, self.dependencies.rerank_node(state))
+            state = self._apply(
+                state,
+                self._call_node(
+                    "rerank_node",
+                    self.dependencies.rerank_node,
+                    state,
+                    extra_metadata={"retrieval_round": retrieval_rounds},
+                ),
+            )
             state = self._log_step("rerank_node", started_at, state, round=retrieval_rounds)
             started_at = time.perf_counter()
-            state = self._apply(state, self.dependencies.retrieval_check_node(state))
+            state = self._apply(
+                state,
+                self._call_node(
+                    "retrieval_check_node",
+                    self.dependencies.retrieval_check_node,
+                    state,
+                    extra_metadata={"retrieval_round": retrieval_rounds},
+                ),
+            )
             state = self._log_step("retrieval_check_node", started_at, state, round=retrieval_rounds)
             self._emit(
                 emitter,
@@ -700,6 +857,7 @@ class LegalQAGraphRuntime:
                 break
         return state
 
+    @_optional_traceable(name="tv6.run_reasoning_cycle", run_type="chain", tags=["tv6", "orchestration", "reasoning"])
     def _run_reasoning_cycle(
         self,
         state: AgentState,
@@ -707,7 +865,7 @@ class LegalQAGraphRuntime:
         emitter: Callable[[dict[str, Any]], None] | None = None,
     ) -> AgentState:
         started_at = time.perf_counter()
-        state = self._apply(state, self.dependencies.generate_draft_node(state))
+        state = self._apply(state, self._call_node("generate_draft_node", self.dependencies.generate_draft_node, state))
         state = self._log_step("generate_draft_node", started_at, state)
         if state.get("draft_answer"):
             self._emit(emitter, "partial_answer", draft_answer=state.get("draft_answer"))
@@ -715,7 +873,10 @@ class LegalQAGraphRuntime:
         revision_loops = 0
         while revision_loops <= self.app_config.max_reasoning_loops:
             started_at = time.perf_counter()
-            state = self._apply(state, self.dependencies.grounding_check_node(state))
+            state = self._apply(
+                state,
+                self._call_node("grounding_check_node", self.dependencies.grounding_check_node, state),
+            )
             state = self._log_step("grounding_check_node", started_at, state, revision=revision_loops)
             self._emit(
                 emitter,
@@ -741,7 +902,7 @@ class LegalQAGraphRuntime:
 
             revision_loops += 1
             started_at = time.perf_counter()
-            state = self._apply(state, self.dependencies.revise_answer_node(state))
+            state = self._apply(state, self._call_node("revise_answer_node", self.dependencies.revise_answer_node, state))
             state = self._log_step("revise_answer_node", started_at, state, revision=revision_loops)
             if state.get("final_answer"):
                 self._emit(emitter, "partial_answer", draft_answer=state.get("final_answer"))
@@ -765,6 +926,11 @@ class LegalQAGraphRuntime:
                 return state
         return state
 
+    @_optional_traceable(
+        name="tv6.run_retrieval_then_reasoning_again",
+        run_type="chain",
+        tags=["tv6", "orchestration", "reasoning"],
+    )
     def _run_retrieval_then_reasoning_again(
         self,
         state: AgentState,
@@ -777,6 +943,7 @@ class LegalQAGraphRuntime:
             return self._apply(state, retrieval_fallback_node(state))
         return self._run_reasoning_cycle(state, emitter=emitter)
 
+    @_optional_traceable(name="tv6.run_fast_path_subgraph", run_type="chain", tags=["tv6", "orchestration", "fast_path"])
     def _run_fast_path_subgraph(
         self,
         state: AgentState,
@@ -793,7 +960,7 @@ class LegalQAGraphRuntime:
             },
         )
         started_at = time.perf_counter()
-        state = self._apply(state, self.dependencies.rewrite_query_node(state))
+        state = self._apply(state, self._call_node("rewrite_query_node", self.dependencies.rewrite_query_node, state))
         state = self._log_step("rewrite_query_node_fast", started_at, state)
         self._emit(
             emitter,
@@ -815,13 +982,16 @@ class LegalQAGraphRuntime:
             return self._apply(state, retrieval_fallback_node(state))
 
         started_at = time.perf_counter()
-        state = self._apply(state, self.dependencies.generate_draft_node(state))
+        state = self._apply(state, self._call_node("generate_draft_node", self.dependencies.generate_draft_node, state))
         state = self._log_step("generate_draft_node_fast", started_at, state)
         if state.get("draft_answer"):
             self._emit(emitter, "partial_answer", draft_answer=state.get("draft_answer"))
 
         started_at = time.perf_counter()
-        state = self._apply(state, self.dependencies.grounding_check_node(state))
+        state = self._apply(
+            state,
+            self._call_node("grounding_check_node", self.dependencies.grounding_check_node, state),
+        )
         state = self._log_step("grounding_check_node_fast", started_at, state)
         self._emit(
             emitter,
@@ -846,6 +1016,11 @@ class LegalQAGraphRuntime:
             return self._run_legal_agent_subgraph(escalated_state, emitter=emitter)
         return state
 
+    @_optional_traceable(
+        name="tv6.run_legal_agent_subgraph",
+        run_type="chain",
+        tags=["tv6", "orchestration", "legal_agent"],
+    )
     def _run_legal_agent_subgraph(
         self,
         state: AgentState,
@@ -862,7 +1037,7 @@ class LegalQAGraphRuntime:
             },
         )
         started_at = time.perf_counter()
-        state = self._apply(state, self.dependencies.rewrite_query_node(state))
+        state = self._apply(state, self._call_node("rewrite_query_node", self.dependencies.rewrite_query_node, state))
         state = self._log_step("rewrite_query_node", started_at, state)
         self._emit(
             emitter,
@@ -890,6 +1065,7 @@ class LegalQAGraphRuntime:
             return self._log_step("human_review_node", started_at, state, stage="post_reasoning")
         return state
 
+    @_optional_traceable(name="tv6.continue_after_route", run_type="chain", tags=["tv6", "orchestration"])
     def _continue_after_route(
         self,
         state: AgentState,
@@ -899,12 +1075,12 @@ class LegalQAGraphRuntime:
         route = str(state.get("next_route") or "legal-agent-path")
         if route == "clarify-path":
             started_at = time.perf_counter()
-            state = self._apply(state, manual_clarify_node(state))
+            state = self._apply(state, self._call_node("manual_clarify_node", manual_clarify_node, state))
             state = self._log_step("clarify_node", started_at, state)
             return self._finish(state, emitter=emitter)
         if route == "unsupported-path":
             started_at = time.perf_counter()
-            state = self._apply(state, unsupported_node(state))
+            state = self._apply(state, self._call_node("unsupported_node", unsupported_node, state))
             state = self._log_step("unsupported_node", started_at, state)
             return self._finish(state, emitter=emitter)
         if route == "human-review-path":
@@ -925,12 +1101,13 @@ class LegalQAGraphRuntime:
         state = self._run_post_reasoning_human_review_if_needed(state, emitter=emitter)
         return self._finish(state, emitter=emitter)
 
+    @_optional_traceable(name="tv6.finish", run_type="chain", tags=["tv6", "orchestration"])
     def _finish(self, state: AgentState, *, emitter: Callable[[dict[str, Any]], None] | None = None) -> AgentState:
         started_at = time.perf_counter()
-        state = self._apply(state, citation_format_node(state))
+        state = self._apply(state, self._call_node("citation_format_node", citation_format_node, state))
         state = self._log_step("citation_format_node", started_at, state)
         started_at = time.perf_counter()
-        state = self._apply(state, final_answer_node(state))
+        state = self._apply(state, self._call_node("final_answer_node", final_answer_node, state))
         state = self._log_step("final_answer_node", started_at, state)
         state = self._finalize_timing(state, emitter=emitter)
         checkpoint_id = self.checkpoint_store.save_state(state)
@@ -953,6 +1130,7 @@ class LegalQAGraphRuntime:
             )
         return state
 
+    @_optional_traceable(name="tv6.invoke", run_type="chain", tags=["tv6", "orchestration", "request"])
     def invoke(
         self,
         state: Mapping[str, Any],
@@ -963,11 +1141,11 @@ class LegalQAGraphRuntime:
 
         working_state = self._start_timing(clone_state(state), phase="invoke")
         started_at = time.perf_counter()
-        working_state = self._apply(working_state, analyze_node(working_state))
+        working_state = self._apply(working_state, self._call_node("analyze_node", analyze_node, working_state))
         working_state = self._log_step("analyze_node", started_at, working_state)
 
         started_at = time.perf_counter()
-        working_state = self._apply(working_state, self.dependencies.route_node(working_state))
+        working_state = self._apply(working_state, self._call_node("route_node", self.dependencies.route_node, working_state))
         working_state = self._log_step("route_node", started_at, working_state)
         self._emit(
             emitter,
@@ -981,6 +1159,7 @@ class LegalQAGraphRuntime:
 
         return self._continue_after_route(working_state, emitter=emitter)
 
+    @_optional_traceable(name="tv6.resume", run_type="chain", tags=["tv6", "orchestration", "resume"])
     def resume(
         self,
         *,
@@ -1008,13 +1187,13 @@ class LegalQAGraphRuntime:
                 raise ValueError("Clarify resume requires `clarify_response` or `note`.")
             state = self._apply(state, {"clarify_response": response_text})
             started_at = time.perf_counter()
-            state = self._apply(state, manual_clarify_node(state))
+            state = self._apply(state, self._call_node("manual_clarify_node", manual_clarify_node, state))
             state = self._log_step("clarify_node_resume", started_at, state, resumed=True)
             started_at = time.perf_counter()
-            state = self._apply(state, analyze_node(state))
+            state = self._apply(state, self._call_node("analyze_node", analyze_node, state))
             state = self._log_step("analyze_node_resume", started_at, state, resumed=True)
             started_at = time.perf_counter()
-            state = self._apply(state, self.dependencies.route_node(state))
+            state = self._apply(state, self._call_node("route_node", self.dependencies.route_node, state))
             state = self._log_step("route_node_resume", started_at, state, resumed=True)
             self._emit(
                 emitter,
@@ -1045,6 +1224,7 @@ class LegalQAGraphRuntime:
 
         raise ValueError(f"Unsupported interrupt kind: {interrupt_kind}")
 
+    @_optional_traceable(name="tv6.stream", run_type="chain", tags=["tv6", "orchestration", "stream"])
     def stream(self, state: Mapping[str, Any]) -> Iterator[dict[str, Any]]:
         """Yield graph events incrementally for SSE streaming."""
 
@@ -1078,6 +1258,7 @@ class LegalQAGraphRuntime:
                 break
             yield item
 
+    @_optional_traceable(name="tv6.stream_resume", run_type="chain", tags=["tv6", "orchestration", "stream", "resume"])
     def stream_resume(
         self,
         *,

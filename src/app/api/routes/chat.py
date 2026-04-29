@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import logging
+import os
+from functools import wraps
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
@@ -9,6 +12,58 @@ from src.graph.builder import LegalQAGraphRuntime
 from src.graph.state import AgentState, create_initial_state
 
 router = APIRouter(tags=["chat"])
+LOGGER = logging.getLogger(__name__)
+
+try:
+    from langsmith import traceable as _langsmith_traceable
+except Exception:  # pragma: no cover - optional dependency.
+    _langsmith_traceable = None
+
+
+def _langsmith_tracing_enabled() -> bool:
+    tracing_flag = str(os.getenv("LANGSMITH_TRACING") or "").strip().lower() in {"1", "true", "yes", "on"}
+    api_key = str(os.getenv("LANGSMITH_API_KEY") or "").strip()
+    return tracing_flag and bool(api_key)
+
+
+def _optional_traceable(*, name: str, run_type: str = "chain", tags: list[str] | None = None):
+    def decorator(func):
+        if _langsmith_traceable is None:
+            @wraps(func)
+            def no_trace(*args, **kwargs):
+                kwargs.pop("langsmith_extra", None)
+                return func(*args, **kwargs)
+
+            return no_trace
+
+        traced_func = _langsmith_traceable(name=name, run_type=run_type, tags=list(tags or []))(func)
+
+        @wraps(func)
+        def wrapped(*args, **kwargs):
+            if not _langsmith_tracing_enabled():
+                kwargs.pop("langsmith_extra", None)
+                return func(*args, **kwargs)
+            return traced_func(*args, **kwargs)
+
+        return wrapped
+
+    return decorator
+
+
+def _safe_preview(text: str, *, max_chars: int = 240) -> str:
+    normalized = " ".join((text or "").split())
+    return normalized[:max_chars].strip()
+
+
+def _request_trace_extra(*, endpoint: str, session_id: str | None, thread_id: str | None, question: str = "") -> dict[str, Any]:
+    metadata = {
+        "endpoint": endpoint,
+        "session_id": str(session_id or ""),
+        "thread_id": str(thread_id or ""),
+    }
+    if question:
+        metadata["question_preview"] = _safe_preview(question)
+    return {"metadata": metadata, "tags": ["api", "chat", "tv6"]}
 
 
 class ChatRequest(BaseModel):
@@ -66,6 +121,11 @@ def build_chat_response(state: AgentState) -> ChatResponse:
     )
 
 
+@_optional_traceable(name="api.chat.request", run_type="chain", tags=["api", "chat", "tv6"])
+def _invoke_chat_request(runtime: LegalQAGraphRuntime, state: AgentState) -> AgentState:
+    return runtime.invoke(state)
+
+
 @router.post("/chat", response_model=ChatResponse)
 def chat(payload: ChatRequest, request: Request) -> ChatResponse:
     """Handle one synchronous chat request against the compiled legal QA graph."""
@@ -77,8 +137,18 @@ def chat(payload: ChatRequest, request: Request) -> ChatResponse:
             session_id=payload.session_id,
             thread_id=payload.thread_id,
         )
-        final_state = runtime.invoke(state)
+        final_state = _invoke_chat_request(
+            runtime,
+            state,
+            langsmith_extra=_request_trace_extra(
+                endpoint="/chat",
+                session_id=payload.session_id,
+                thread_id=payload.thread_id,
+                question=payload.question,
+            ),
+        )
     except Exception as exc:  # pragma: no cover - runtime path.
+        LOGGER.exception("Chat request failed.")
         raise HTTPException(status_code=500, detail=f"Graph execution failed: {exc}") from exc
     return build_chat_response(final_state)
 

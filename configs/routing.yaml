@@ -46,8 +46,15 @@ route_policy_flags:
   enable_fast_path: true
   prefer_human_review_for_high_risk: true
 
-model_type: rule_based
+model_type: llm_based
 model_path: ""
+
+llm_provider: ollama
+llm_model: ${OLLAMA_ROUTER_MODEL:qwen2.5:7b}
+llm_base_url: ${OLLAMA_BASE_URL:http://localhost:11434}
+llm_timeout_seconds: 20
+llm_temperature: 0.0
+llm_fallback_to_rule_based: true
 
 rule_keywords:
   hoi_dinh_nghia:

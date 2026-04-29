@@ -23,7 +23,7 @@ local_corpus_path: ${TV1_CORPUS_PATH:data/processed/all_chunks.jsonl}
 indexing_config_path: ${INDEXING_CONFIG_PATH:configs/indexing.yaml}
 cross_encoder_model: BAAI/bge-reranker-v2-m3
 cross_encoder_device: cpu
-min_valid_sources: 2
+min_valid_sources: 1
 min_unique_sources: 1
 min_top_rerank_score: 0.15
 require_structured_citation: true

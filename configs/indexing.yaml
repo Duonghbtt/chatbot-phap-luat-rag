@@ -2,6 +2,7 @@ qdrant:
   url: ${QDRANT_URL:http://localhost:6333}
   api_key: ${QDRANT_API_KEY:}
   prefer_grpc: false
+  timeout_seconds: 120
   distance: cosine
   hnsw_config:
     m: 32
@@ -28,13 +29,16 @@ collections:
 indexing:
   level: article
   top_k_default: 5
-  batch_upsert_size: 64
+  batch_upsert_size: 16
   recreate_if_exists: false
   keep_last_n_versions: 3
   insert_max_retries: 3
   insert_retry_backoff_seconds: 2.0
   delete_stale_points_on_incremental: true
   text_field_for_embedding: retrieval_text
+  max_retrieval_text_chars: 12000
+  max_payload_content_chars: 50000
+  mark_truncated_payload: true
 
 payload_fields:
   law_id: keyword

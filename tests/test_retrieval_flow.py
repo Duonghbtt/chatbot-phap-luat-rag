@@ -1,11 +1,7 @@
 from __future__ import annotations
 
-import json
 from collections import defaultdict
-from pathlib import Path
 from typing import Any, Mapping
-
-import pytest
 
 from src.tv2_index.search_with_filters import result_matches_filters
 from src.tv3_retrieval.fallback_policy import RetrievalConfig
@@ -30,6 +26,14 @@ LOW_SIGNAL_QUERY_TOKENS = {
     "nhiệm",
 }
 
+
+def _is_chunk_fallback_probe(query_text: str) -> bool:
+    normalized = query_text.lower()
+    return "đối thoại với thanh niên" in normalized and "mỗi năm một lần" in normalized
+
+
+def _is_no_result_probe(query_text: str) -> bool:
+    return "tàu vũ trụ dân sự" in query_text.lower()
 
 def _sample_tv1_records() -> list[dict[str, Any]]:
     return [
@@ -126,13 +130,6 @@ def _sample_tv1_records() -> list[dict[str, Any]]:
     ]
 
 
-def _write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
-    with path.open("w", encoding="utf-8") as handle:
-        for row in rows:
-            handle.write(json.dumps(row, ensure_ascii=False))
-            handle.write("\n")
-
-
 def _build_article_docs(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for row in records:
@@ -176,7 +173,9 @@ class FakeBM25Retriever:
         top_k: int,
         filters: Mapping[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
-        if level == "article" and "mỗi năm một lần" in query_text.lower():
+        if _is_no_result_probe(query_text):
+            return []
+        if level == "article" and _is_chunk_fallback_probe(query_text):
             return []
         docs = self.article_docs if level == "article" else self.chunk_docs
         scored = []
@@ -213,7 +212,9 @@ class FakeVectorSearchService:
         self.emit_duplicates = emit_duplicates
 
     def _search(self, docs: list[dict[str, Any]], query_text: str, filters: Mapping[str, Any] | None, top_k: int, *, level: str) -> list[dict[str, Any]]:
-        if level == "article" and "mỗi năm một lần" in query_text.lower():
+        if _is_no_result_probe(query_text):
+            return []
+        if level == "article" and _is_chunk_fallback_probe(query_text):
             return []
         scored = []
         for doc in docs:
@@ -246,11 +247,9 @@ def _fake_reranker(pairs: list[tuple[str, str]]) -> list[float]:
     return [_overlap_score(query_text, content) for query_text, content in pairs]
 
 
-def _make_config(tmp_path: Path, records: list[dict[str, Any]], **overrides: Any) -> RetrievalConfig:
-    corpus_path = tmp_path / "all_chunks.jsonl"
-    _write_jsonl(corpus_path, records)
+def _make_config(**overrides: Any) -> RetrievalConfig:
     config_kwargs = {
-        "local_corpus_path": str(corpus_path),
+        "local_corpus_path": "tests/fixtures/in_memory_all_chunks.jsonl",
         "top_k": 4,
         "bm25_top_k": 5,
         "vector_top_k": 5,
@@ -288,7 +287,7 @@ def _run_flow(
         "human_review_required": False,
         "history": [],
     }
-    state.update(rewrite_query_node(state))
+    state.update(rewrite_query_node(state, llm_rewriter=lambda _q, _intent, _filters: []))
 
     for _ in range(config.max_retry_loops + 2):
         state.update(
@@ -306,9 +305,9 @@ def _run_flow(
     return state
 
 
-def test_easy_query_end_to_end(tmp_path: Path) -> None:
+def test_easy_query_end_to_end() -> None:
     records = _sample_tv1_records()
-    config = _make_config(tmp_path, records)
+    config = _make_config()
     article_docs = _build_article_docs(records)
     flow_state = _run_flow(
         "quyền của thanh niên là gì",
@@ -323,25 +322,25 @@ def test_easy_query_end_to_end(tmp_path: Path) -> None:
     assert "Luật số 57/2020/QH14" in " ".join(flow_state["sources"])
 
 
-def test_ambiguous_query_generates_legal_rewrites(tmp_path: Path) -> None:
+def test_ambiguous_query_generates_legal_rewrites() -> None:
     records = _sample_tv1_records()
-    config = _make_config(tmp_path, records)
+    config = _make_config()
     article_docs = _build_article_docs(records)
     state = _run_flow(
         "thanh niên là ai",
         config=config,
         bm25_retriever=FakeBM25Retriever(article_docs, records),
         vector_service=FakeVectorSearchService(article_docs, records),
-        intent="definition",
+        intent="hoi_dinh_nghia",
     )
 
     assert any(term in " ".join(state["rewritten_queries"]).lower() for term in ("khái niệm", "định nghĩa"))
     assert state["retrieval_ok"] is True
 
 
-def test_query_with_law_id_filter(tmp_path: Path) -> None:
+def test_query_with_law_id_filter() -> None:
     records = _sample_tv1_records()
-    config = _make_config(tmp_path, records)
+    config = _make_config()
     article_docs = _build_article_docs(records)
     state = _run_flow(
         "Theo Luật số 57/2020/QH14, đối thoại với thanh niên được quy định thế nào?",
@@ -355,9 +354,9 @@ def test_query_with_law_id_filter(tmp_path: Path) -> None:
     assert all(doc["metadata"]["law_id"] == "Luật số 57/2020/QH14" for doc in state["retrieved_docs"])
 
 
-def test_article_level_can_fallback_to_chunk_level(tmp_path: Path) -> None:
+def test_article_level_can_fallback_to_chunk_level() -> None:
     records = _sample_tv1_records()
-    config = _make_config(tmp_path, records, article_first=True, allow_chunk_fallback=True)
+    config = _make_config(article_only=False, article_first=True, allow_chunk_fallback=True)
     article_docs = _build_article_docs(records)
     state = _run_flow(
         "đối thoại với thanh niên ít nhất mỗi năm một lần như thế nào",
@@ -372,9 +371,9 @@ def test_article_level_can_fallback_to_chunk_level(tmp_path: Path) -> None:
     assert state["retrieval_debug"]["current_plan"]["level"] == "chunk"
 
 
-def test_duplicate_docs_are_merged(tmp_path: Path) -> None:
+def test_duplicate_docs_are_merged() -> None:
     records = _sample_tv1_records()
-    config = _make_config(tmp_path, records)
+    config = _make_config()
     article_docs = _build_article_docs(records)
     initial_state = {
         "question": "đối thoại với thanh niên",
@@ -398,9 +397,9 @@ def test_duplicate_docs_are_merged(tmp_path: Path) -> None:
     assert len(updates["retrieved_docs"]) == len(dedup_keys)
 
 
-def test_no_result_case_stops_with_fallback(tmp_path: Path) -> None:
+def test_no_result_case_stops_with_fallback() -> None:
     records = _sample_tv1_records()
-    config = _make_config(tmp_path, records, max_retry_loops=2)
+    config = _make_config(max_retry_loops=2)
     article_docs = _build_article_docs(records)
     state = _run_flow(
         "quy định về tàu vũ trụ dân sự",

@@ -42,6 +42,7 @@ class QdrantConfig:
     url: str = "http://localhost:6333"
     api_key: str = ""
     prefer_grpc: bool = False
+    timeout_seconds: float = 120.0
     distance: str = "cosine"
     hnsw_config: dict[str, Any] = field(default_factory=dict)
 
@@ -68,6 +69,10 @@ class IndexingRuntimeConfig:
     insert_max_retries: int = 3
     insert_retry_backoff_seconds: float = 2.0
     delete_stale_points_on_incremental: bool = True
+    text_field_for_embedding: str = "retrieval_text"
+    max_retrieval_text_chars: int = 12000
+    max_payload_content_chars: int = 50000
+    mark_truncated_payload: bool = True
 
 
 @dataclass(slots=True, frozen=True)
@@ -293,6 +298,7 @@ def load_indexing_config(config_path: str | Path | None = None) -> AppConfig:
             url=str(qdrant_data.get("url") or "http://localhost:6333"),
             api_key=str(qdrant_data.get("api_key") or ""),
             prefer_grpc=_coerce_bool(qdrant_data.get("prefer_grpc", False)),
+            timeout_seconds=float(qdrant_data.get("timeout_seconds") or 120.0),
             distance=str(qdrant_data.get("distance") or "cosine"),
             hnsw_config=dict(qdrant_data.get("hnsw_config") or {}),
         ),
@@ -332,6 +338,12 @@ def load_indexing_config(config_path: str | Path | None = None) -> AppConfig:
             delete_stale_points_on_incremental=_coerce_bool(
                 indexing_data.get("delete_stale_points_on_incremental", True)
             ),
+            text_field_for_embedding=str(
+                indexing_data.get("text_field_for_embedding") or "retrieval_text"
+            ),
+            max_retrieval_text_chars=int(indexing_data.get("max_retrieval_text_chars") or 12000),
+            max_payload_content_chars=int(indexing_data.get("max_payload_content_chars") or 50000),
+            mark_truncated_payload=_coerce_bool(indexing_data.get("mark_truncated_payload", True)),
         ),
         payload_fields={str(key): str(value) for key, value in payload_fields.items()},
         config_path=resolved_path,

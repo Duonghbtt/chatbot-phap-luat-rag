@@ -6,6 +6,7 @@ import os
 import re
 import time
 from dataclasses import dataclass
+from functools import wraps
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 from urllib import error, request
@@ -21,6 +22,41 @@ from src.tv5_reasoning.prompt_library import (
 LOGGER = logging.getLogger(__name__)
 DEFAULT_LLM_CONFIG_PATH = Path("configs/llm.yaml")
 ENV_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)(?::([^}]*))?\}")
+
+try:
+    from langsmith import traceable as _langsmith_traceable
+except Exception:  # pragma: no cover - optional dependency.
+    _langsmith_traceable = None
+
+
+def _langsmith_tracing_enabled() -> bool:
+    tracing_flag = str(os.getenv("LANGSMITH_TRACING") or "").strip().lower() in {"1", "true", "yes", "on"}
+    api_key = str(os.getenv("LANGSMITH_API_KEY") or "").strip()
+    return tracing_flag and bool(api_key)
+
+
+def _optional_traceable(*, name: str, run_type: str = "chain", tags: list[str] | None = None):
+    def decorator(func):
+        if _langsmith_traceable is None:
+            @wraps(func)
+            def no_trace(*args, **kwargs):
+                kwargs.pop("langsmith_extra", None)
+                return func(*args, **kwargs)
+
+            return no_trace
+
+        traced_func = _langsmith_traceable(name=name, run_type=run_type, tags=list(tags or []))(func)
+
+        @wraps(func)
+        def wrapped(*args, **kwargs):
+            if not _langsmith_tracing_enabled():
+                kwargs.pop("langsmith_extra", None)
+                return func(*args, **kwargs)
+            return traced_func(*args, **kwargs)
+
+        return wrapped
+
+    return decorator
 
 
 @dataclass(slots=True, frozen=True)
@@ -344,6 +380,7 @@ def generate_draft(
     }
 
 
+@_optional_traceable(name="tv5.generate_draft_node", run_type="chain", tags=["tv5", "reasoning"])
 def generate_draft_node(
     state: Mapping[str, Any],
     *,

@@ -1,10 +1,56 @@
 from __future__ import annotations
 
+import json
 import logging
+import os
 import re
+from functools import wraps
+from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
+from src.tv5_reasoning.generate_draft_node import (
+    DEFAULT_LLM_CONFIG_PATH,
+    LLMConfig,
+    OllamaChatClient,
+    load_llm_config,
+)
+
 LOGGER = logging.getLogger(__name__)
+
+try:
+    from langsmith import traceable as _langsmith_traceable
+except Exception:  # pragma: no cover - optional dependency.
+    _langsmith_traceable = None
+
+
+def _langsmith_tracing_enabled() -> bool:
+    tracing_flag = str(os.getenv("LANGSMITH_TRACING") or "").strip().lower() in {"1", "true", "yes", "on"}
+    api_key = str(os.getenv("LANGSMITH_API_KEY") or "").strip()
+    return tracing_flag and bool(api_key)
+
+
+def _optional_traceable(*, name: str, run_type: str = "chain", tags: list[str] | None = None):
+    def decorator(func):
+        if _langsmith_traceable is None:
+            @wraps(func)
+            def no_trace(*args, **kwargs):
+                kwargs.pop("langsmith_extra", None)
+                return func(*args, **kwargs)
+
+            return no_trace
+
+        traced_func = _langsmith_traceable(name=name, run_type=run_type, tags=list(tags or []))(func)
+
+        @wraps(func)
+        def wrapped(*args, **kwargs):
+            if not _langsmith_tracing_enabled():
+                kwargs.pop("langsmith_extra", None)
+                return func(*args, **kwargs)
+            return traced_func(*args, **kwargs)
+
+        return wrapped
+
+    return decorator
 
 LAW_ID_PATTERN = re.compile(
     r"\b("
@@ -67,6 +113,14 @@ TERM_EXPANSIONS: dict[str, Sequence[str]] = {
     "điều kiện": ("điều kiện", "đối tượng áp dụng", "trình tự thủ tục"),
     "khái niệm": ("khái niệm", "định nghĩa", "giải thích từ ngữ"),
 }
+
+DEFAULT_REWRITE_SYSTEM_PROMPT = (
+    "Bạn là chuyên gia rewrite truy vấn cho legal retrieval tiếng Việt. "
+    "Nhiệm vụ là tạo 1-3 truy vấn tìm kiếm ngắn gọn, sát câu hỏi gốc, "
+    "ưu tiên giữ nguyên các tham chiếu pháp lý như Điều, law_id, title, article_code. "
+    "Không trả lời tư vấn pháp luật. Không bịa thêm chi tiết. "
+    "Chỉ trả về JSON với khóa `rewritten_queries` là mảng chuỗi."
+)
 
 
 def normalize_legal_text(text: str) -> str:
@@ -189,6 +243,94 @@ def _dedupe_queries(queries: Sequence[str], *, limit: int) -> list[str]:
     return deduped
 
 
+def _extract_json_object(text: str) -> dict[str, Any] | None:
+    cleaned = normalize_legal_text(text)
+    if not cleaned:
+        return None
+    try:
+        parsed = json.loads(cleaned)
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        pass
+
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        return None
+    try:
+        parsed = json.loads(cleaned[start : end + 1])
+        return parsed if isinstance(parsed, dict) else None
+    except json.JSONDecodeError:
+        return None
+
+
+def _extract_queries_from_llm_response(raw_response: str) -> list[str]:
+    payload = _extract_json_object(raw_response) or {}
+    for key in ("rewritten_queries", "queries", "search_queries"):
+        values = payload.get(key)
+        if isinstance(values, list):
+            return [normalize_legal_text(str(item)) for item in values if normalize_legal_text(str(item))]
+
+    fallback_queries: list[str] = []
+    for line in str(raw_response or "").splitlines():
+        cleaned = normalize_legal_text(re.sub(r"^[\-\*\d\.\)\s]+", "", line))
+        if cleaned and cleaned not in fallback_queries:
+            fallback_queries.append(cleaned)
+    return fallback_queries
+
+
+def _build_llm_rewrite_prompt(
+    question: str,
+    *,
+    intent: str,
+    metadata_filters: Mapping[str, str],
+) -> str:
+    filter_lines = [
+        f"- {key}: {value}"
+        for key, value in metadata_filters.items()
+        if normalize_legal_text(str(value))
+    ]
+    filters_block = "\n".join(filter_lines) if filter_lines else "- không có filter cấu trúc"
+    return (
+        "Hãy rewrite câu hỏi pháp luật dưới đây thành các truy vấn retrieval.\n"
+        "Ràng buộc:\n"
+        "- Tối đa 3 truy vấn.\n"
+        "- Ưu tiên exact legal hit.\n"
+        "- Giữ nguyên điều luật, law_id, title nếu đã có.\n"
+        "- Không mở rộng quá xa ý nghĩa câu hỏi gốc.\n"
+        "- Truy vấn phải ngắn, dùng để search chứ không phải câu trả lời.\n\n"
+        f"Câu hỏi gốc: {question}\n"
+        f"Intent: {intent or 'không rõ'}\n"
+        f"Metadata filters đã parse:\n{filters_block}\n\n"
+        "Xuất JSON duy nhất, ví dụ:\n"
+        '{"rewritten_queries": ["...", "..."]}'
+    )
+
+
+def _default_llm_rewriter(
+    question: str,
+    intent: str,
+    metadata_filters: Mapping[str, str],
+    *,
+    llm_config: LLMConfig | None = None,
+    llm_config_path: str | Path | None = None,
+    logger: logging.Logger | None = None,
+) -> list[str]:
+    resolved_logger = logger or LOGGER
+    resolved_config = llm_config or load_llm_config(llm_config_path or DEFAULT_LLM_CONFIG_PATH)
+    client = OllamaChatClient(resolved_config, logger=resolved_logger)
+    prompt = _build_llm_rewrite_prompt(
+        question,
+        intent=intent,
+        metadata_filters=metadata_filters,
+    )
+    raw_response = client.generate_with_retry(
+        prompt=prompt,
+        system_prompt=DEFAULT_REWRITE_SYSTEM_PROMPT,
+    )
+    return _extract_queries_from_llm_response(raw_response)
+
+
 def _build_structured_queries(
     base_question: str,
     metadata_filters: Mapping[str, str],
@@ -257,6 +399,8 @@ def rewrite_query(
     intent: str = "",
     execution_profile: str = "full",
     llm_rewriter: Callable[[str, str, Mapping[str, str]], Sequence[str]] | None = None,
+    llm_config: LLMConfig | None = None,
+    llm_config_path: str | Path | None = None,
     logger: logging.Logger | None = None,
 ) -> dict[str, Any]:
     """Rewrite a legal question into retrieval-friendly variants."""
@@ -266,13 +410,23 @@ def rewrite_query(
     metadata_filters = extract_metadata_filters(base_question)
     legal_query_features = extract_legal_query_features(base_question, metadata_filters)
     normalized_profile = "fast" if execution_profile == "fast" else "full"
+    resolved_llm_rewriter = llm_rewriter
+    if resolved_llm_rewriter is None and normalized_profile != "fast":
+        resolved_llm_rewriter = lambda q, i, filters: _default_llm_rewriter(
+            q,
+            i,
+            filters,
+            llm_config=llm_config,
+            llm_config_path=llm_config_path,
+            logger=resolved_logger,
+        )
 
     llm_queries: list[str] = []
-    if llm_rewriter is not None and normalized_profile != "fast":
+    if resolved_llm_rewriter is not None and normalized_profile != "fast":
         try:
             llm_queries = [
                 normalize_legal_text(item)
-                for item in llm_rewriter(base_question, intent, metadata_filters)
+                for item in resolved_llm_rewriter(base_question, intent, metadata_filters)
                 if normalize_legal_text(item)
             ]
         except Exception as exc:  # pragma: no cover
@@ -301,14 +455,24 @@ def rewrite_query(
             "legal_query_features": dict(legal_query_features),
             "rewrite_strategy": rewrite_strategy,
             "execution_profile": normalized_profile,
+            "llm_rewrite_enabled": normalized_profile != "fast",
+            "llm_rewrite_used": bool(llm_queries),
+            "llm_rewrite_model": (
+                (llm_config or load_llm_config(llm_config_path or DEFAULT_LLM_CONFIG_PATH)).model_name
+                if normalized_profile != "fast"
+                else ""
+            ),
         },
     }
 
 
+@_optional_traceable(name="tv3.rewrite_query_node", run_type="chain", tags=["tv3", "retrieval"])
 def rewrite_query_node(
     state: Mapping[str, Any],
     *,
     llm_rewriter: Callable[[str, str, Mapping[str, str]], Sequence[str]] | None = None,
+    llm_config: LLMConfig | None = None,
+    llm_config_path: str | Path | None = None,
     logger: logging.Logger | None = None,
 ) -> dict[str, Any]:
     """LangGraph-friendly TV3 node for query rewriting."""
@@ -323,6 +487,8 @@ def rewrite_query_node(
         intent=intent,
         execution_profile=execution_profile,
         llm_rewriter=llm_rewriter,
+        llm_config=llm_config,
+        llm_config_path=llm_config_path,
         logger=logger,
     )
 

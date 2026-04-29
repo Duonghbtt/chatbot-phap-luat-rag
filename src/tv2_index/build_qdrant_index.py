@@ -64,6 +64,41 @@ def build_article_retrieval_text(metadata: Mapping[str, Any], content: str) -> s
     return ". ".join(text_parts).strip()
 
 
+def _clip_text(text: str, max_chars: int) -> tuple[str, bool]:
+    """Clip overly large text fields before embedding/upserting into Qdrant."""
+
+    normalized = str(text or "")
+    if max_chars <= 0 or len(normalized) <= max_chars:
+        return normalized, False
+    return normalized[:max_chars].rstrip(), True
+
+
+def _log_truncated_document(
+    *,
+    level: str,
+    metadata: Mapping[str, Any],
+    original_content_length: int,
+    payload_content_length: int,
+    original_retrieval_text_length: int,
+    embedding_text_length: int,
+) -> None:
+    LOGGER.warning(
+        "Truncated oversized %s document before indexing "
+        "(title=%r law_id=%r article=%r article_code=%r article_name=%r "
+        "content_len=%s payload_content_len=%s retrieval_text_len=%s embedding_text_len=%s)",
+        level,
+        metadata.get("title"),
+        metadata.get("law_id"),
+        metadata.get("article"),
+        metadata.get("article_code"),
+        metadata.get("article_name"),
+        original_content_length,
+        payload_content_length,
+        original_retrieval_text_length,
+        embedding_text_length,
+    )
+
+
 def setup_logging(level: str = "INFO") -> None:
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
@@ -155,7 +190,13 @@ def _hash_text(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8")).hexdigest()
 
 
-def prepare_chunk_documents(records: Sequence[dict[str, Any]]) -> list[IndexDocument]:
+def prepare_chunk_documents(
+    records: Sequence[dict[str, Any]],
+    *,
+    max_retrieval_text_chars: int = 0,
+    max_payload_content_chars: int = 0,
+    mark_truncated_payload: bool = True,
+) -> list[IndexDocument]:
     """Prepare chunk-level Qdrant documents from TV1 records."""
 
     documents: list[IndexDocument] = []
@@ -163,6 +204,17 @@ def prepare_chunk_documents(records: Sequence[dict[str, Any]]) -> list[IndexDocu
         content = str(record.get("content") or "").strip()
         metadata = dict(record.get("metadata") or {})
         metadata.setdefault("related_articles", [])
+        payload_content, content_truncated = _clip_text(content, max_payload_content_chars)
+        embedding_text, retrieval_text_truncated = _clip_text(content, max_retrieval_text_chars)
+        if content_truncated or retrieval_text_truncated:
+            _log_truncated_document(
+                level="chunk",
+                metadata=metadata,
+                original_content_length=len(content),
+                payload_content_length=len(payload_content),
+                original_retrieval_text_length=len(content),
+                embedding_text_length=len(embedding_text),
+            )
         point_key = "|".join(
             [
                 str(metadata.get("file_id") or ""),
@@ -175,23 +227,35 @@ def prepare_chunk_documents(records: Sequence[dict[str, Any]]) -> list[IndexDocu
         payload = {
             **metadata,
             "metadata": metadata,
-            "content": content,
-            "retrieval_text": content,
+            "content": payload_content,
+            "retrieval_text": embedding_text,
             "doc_type": "chunk",
             "content_length": len(content),
+            "payload_content_length": len(payload_content),
+            "retrieval_text_length": len(content),
+            "embedding_text_length": len(embedding_text),
             "effective_date_iso": parse_effective_date_to_iso(str(metadata.get("effective_date") or "")),
         }
+        if mark_truncated_payload:
+            payload["content_truncated"] = content_truncated
+            payload["retrieval_text_truncated"] = retrieval_text_truncated
         documents.append(
             IndexDocument(
                 point_id=stable_point_id("chunk", point_key),
-                content=content,
+                content=embedding_text or payload_content,
                 payload=payload,
             )
         )
     return documents
 
 
-def prepare_article_documents(records: Sequence[dict[str, Any]]) -> list[IndexDocument]:
+def prepare_article_documents(
+    records: Sequence[dict[str, Any]],
+    *,
+    max_retrieval_text_chars: int = 0,
+    max_payload_content_chars: int = 0,
+    mark_truncated_payload: bool = True,
+) -> list[IndexDocument]:
     """Aggregate TV1 chunk records into article-level documents."""
 
     grouped: OrderedDict[str, dict[str, Any]] = OrderedDict()
@@ -222,20 +286,40 @@ def prepare_article_documents(records: Sequence[dict[str, Any]]) -> list[IndexDo
         metadata["related_articles"] = list(bucket["related_articles"].keys())
         content = "\n\n".join(bucket["contents"]).strip()
         retrieval_text = build_article_retrieval_text(metadata, content)
+        payload_content, content_truncated = _clip_text(content, max_payload_content_chars)
+        embedding_text, retrieval_text_truncated = _clip_text(
+            retrieval_text,
+            max_retrieval_text_chars,
+        )
+        if content_truncated or retrieval_text_truncated:
+            _log_truncated_document(
+                level="article",
+                metadata=metadata,
+                original_content_length=len(content),
+                payload_content_length=len(payload_content),
+                original_retrieval_text_length=len(retrieval_text),
+                embedding_text_length=len(embedding_text),
+            )
         payload = {
             **metadata,
             "metadata": metadata,
-            "content": content,
-            "retrieval_text": retrieval_text,
+            "content": payload_content,
+            "retrieval_text": embedding_text,
             "doc_type": "article",
             "content_length": len(content),
+            "payload_content_length": len(payload_content),
+            "retrieval_text_length": len(retrieval_text),
+            "embedding_text_length": len(embedding_text),
             "chunk_count": int(bucket["chunk_count"]),
             "effective_date_iso": parse_effective_date_to_iso(str(metadata.get("effective_date") or "")),
         }
+        if mark_truncated_payload:
+            payload["content_truncated"] = content_truncated
+            payload["retrieval_text_truncated"] = retrieval_text_truncated
         documents.append(
             IndexDocument(
                 point_id=stable_point_id("article", group_key),
-                content=retrieval_text or content,
+                content=embedding_text or payload_content,
                 payload=payload,
             )
         )
@@ -274,11 +358,33 @@ def resolve_collection_name(
     raise ValueError(f"Unsupported index level: {level}")
 
 
-def build_documents_for_level(level: str, records: Sequence[dict[str, Any]]) -> list[IndexDocument]:
+def build_documents_for_level(
+    level: str,
+    records: Sequence[dict[str, Any]],
+    config: AppConfig | None = None,
+) -> list[IndexDocument]:
+    max_retrieval_text_chars = 0
+    max_payload_content_chars = 0
+    mark_truncated_payload = True
+    if config is not None:
+        max_retrieval_text_chars = int(config.indexing.max_retrieval_text_chars or 0)
+        max_payload_content_chars = int(config.indexing.max_payload_content_chars or 0)
+        mark_truncated_payload = bool(config.indexing.mark_truncated_payload)
+
     if level == "chunk":
-        return prepare_chunk_documents(records)
+        return prepare_chunk_documents(
+            records,
+            max_retrieval_text_chars=max_retrieval_text_chars,
+            max_payload_content_chars=max_payload_content_chars,
+            mark_truncated_payload=mark_truncated_payload,
+        )
     if level == "article":
-        return prepare_article_documents(records)
+        return prepare_article_documents(
+            records,
+            max_retrieval_text_chars=max_retrieval_text_chars,
+            max_payload_content_chars=max_payload_content_chars,
+            mark_truncated_payload=mark_truncated_payload,
+        )
     raise ValueError(f"Unsupported index level: {level}")
 
 
@@ -398,7 +504,7 @@ def run_build(
         if alias_target:
             resolved_logger.info("Resolved alias %s -> %s for indexing", target_collection, alias_target)
             target_collection = alias_target
-        documents = build_documents_for_level(current_level, records)
+        documents = build_documents_for_level(current_level, records, config)
         resolved_logger.info(
             "Preparing %s documents for level=%s into collection=%s",
             len(documents),

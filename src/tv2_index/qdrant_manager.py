@@ -38,12 +38,32 @@ class QdrantManager:
         self.config = config or load_indexing_config(config_path or DEFAULT_CONFIG_PATH)
         self.logger = logger or LOGGER
         qdrant_client_cls, models = _load_qdrant_modules()
+        self._qdrant_client_cls = qdrant_client_cls
         self.models = models
-        self.client = qdrant_client_cls(
-            url=self.config.qdrant.url,
-            api_key=self.config.qdrant.api_key or None,
-            prefer_grpc=self.config.qdrant.prefer_grpc,
-        )
+        self.client = self._create_client()
+
+    def _create_client(self) -> Any:
+        """Create a Qdrant client with the configured timeout."""
+
+        kwargs = {
+            "url": self.config.qdrant.url,
+            "api_key": self.config.qdrant.api_key or None,
+            "prefer_grpc": self.config.qdrant.prefer_grpc,
+            "timeout": self.config.qdrant.timeout_seconds,
+        }
+        try:
+            return self._qdrant_client_cls(**kwargs)
+        except TypeError:
+            kwargs.pop("timeout", None)
+            self.logger.warning(
+                "Installed qdrant-client does not support timeout=; continuing without client timeout override."
+            )
+            return self._qdrant_client_cls(**kwargs)
+
+    def _reset_client(self) -> None:
+        """Recreate the HTTP client after connection reset/read errors."""
+
+        self.client = self._create_client()
 
     def _distance_enum(self, distance_name: str) -> Any:
         normalized = distance_name.strip().upper()
@@ -280,6 +300,7 @@ class QdrantManager:
                             f"Failed to upsert batch into {collection_name} after {max_retries} attempts"
                         ) from exc
                     sleep_for = retry_backoff_seconds * attempt
+                    self._reset_client()
                     self.logger.warning(
                         "Upsert attempt %s/%s failed for %s (%s). Retrying in %.1fs.",
                         attempt,

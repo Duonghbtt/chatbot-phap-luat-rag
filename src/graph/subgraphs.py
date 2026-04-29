@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import os
+from functools import wraps
 from typing import Any, Mapping
 
 from langgraph.graph import END, START, StateGraph
@@ -16,7 +18,43 @@ from src.tv5_reasoning.revise_answer_node import revise_answer_node
 
 LOGGER = logging.getLogger(__name__)
 
+try:
+    from langsmith import traceable as _langsmith_traceable
+except Exception:  # pragma: no cover - optional dependency.
+    _langsmith_traceable = None
 
+
+def _langsmith_tracing_enabled() -> bool:
+    tracing_flag = str(os.getenv("LANGSMITH_TRACING") or "").strip().lower() in {"1", "true", "yes", "on"}
+    api_key = str(os.getenv("LANGSMITH_API_KEY") or "").strip()
+    return tracing_flag and bool(api_key)
+
+
+def _optional_traceable(*, name: str, run_type: str = "chain", tags: list[str] | None = None):
+    def decorator(func):
+        if _langsmith_traceable is None:
+            @wraps(func)
+            def no_trace(*args, **kwargs):
+                kwargs.pop("langsmith_extra", None)
+                return func(*args, **kwargs)
+
+            return no_trace
+
+        traced_func = _langsmith_traceable(name=name, run_type=run_type, tags=list(tags or []))(func)
+
+        @wraps(func)
+        def wrapped(*args, **kwargs):
+            if not _langsmith_tracing_enabled():
+                kwargs.pop("langsmith_extra", None)
+                return func(*args, **kwargs)
+            return traced_func(*args, **kwargs)
+
+        return wrapped
+
+    return decorator
+
+
+@_optional_traceable(name="tv6.prepare_revision_retry_node", run_type="chain", tags=["tv6", "orchestration"])
 def _prepare_revision_retry_node(state: Mapping[str, Any]) -> dict[str, Any]:
     """Promote the revised answer into `draft_answer` before another grounding pass."""
 
@@ -43,6 +81,7 @@ def _make_grounding_router(max_reasoning_loops: int):
     return route_grounding_decision
 
 
+@_optional_traceable(name="tv6.build_legal_agent_subgraph", run_type="chain", tags=["tv6", "orchestration"])
 def build_legal_agent_subgraph(*, logger: logging.Logger | None = None, max_reasoning_loops: int = 2) -> Any:
     """Build the reusable legal-agent subgraph by composing TV3 + TV5 nodes."""
 
@@ -86,6 +125,7 @@ def build_legal_agent_subgraph(*, logger: logging.Logger | None = None, max_reas
     return graph.compile()
 
 
+@_optional_traceable(name="tv6.build_review_subgraph", run_type="chain", tags=["tv6", "orchestration"])
 def build_review_subgraph(*, logger: logging.Logger | None = None) -> Any:
     """Build the reusable human-review subgraph."""
 
