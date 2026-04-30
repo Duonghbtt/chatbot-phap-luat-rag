@@ -79,6 +79,24 @@ LEGAL_DOCUMENT_HINTS = [
 
 ARTICLE_REFERENCE_PATTERN = re.compile(r"\b(điều|khoản|điểm)\s+\w+", re.IGNORECASE)
 
+AMBIGUOUS_RULE_REFERENCE_PHRASES = [
+    "quy định này",
+    "điều này",
+    "khoản này",
+]
+
+DEFINITION_LOOKUP_PHRASES = [
+    "là gì",
+    "khái niệm",
+    "định nghĩa",
+    "quyền của",
+    "nghĩa vụ của",
+    "trách nhiệm của",
+    "ai có trách nhiệm",
+    "đối tượng nào",
+    "được hiểu là gì",
+]
+
 SLOT_QUESTIONS = {
     "hanh_vi_vi_pham": "Bạn muốn hỏi về hành vi vi phạm nào cụ thể?",
     "chu_the": "Quy định này đang áp dụng cho chủ thể nào cụ thể, ví dụ cá nhân, doanh nghiệp hay hộ gia đình?",
@@ -111,7 +129,8 @@ def _detect_missing_slots(question: str, config: RoutingConfig) -> list[str]:
     is_too_short = len(normalized) < config.clarify_min_length or len(tokens) < 3
 
     asks_penalty = any(phrase in normalized for phrase in ("mức phạt", "phạt bao nhiêu", "xử phạt bao nhiêu"))
-    asks_what_rule = any(phrase in normalized for phrase in ("quy định này", "điều này", "khoản này", "là gì"))
+    asks_ambiguous_rule_reference = any(phrase in normalized for phrase in AMBIGUOUS_RULE_REFERENCE_PHRASES)
+    asks_definition_lookup = any(phrase in normalized for phrase in DEFINITION_LOOKUP_PHRASES)
     asks_should_sue = any(phrase in normalized for phrase in ("có nên kiện", "có nên khởi kiện", "nên khởi kiện"))
     asks_procedure = any(phrase in normalized for phrase in ("thủ tục", "hồ sơ", "cách làm", "trình tự"))
 
@@ -128,7 +147,7 @@ def _detect_missing_slots(question: str, config: RoutingConfig) -> list[str]:
     if asks_should_sue and not has_dispute:
         missing_slots.append("loai_tranh_chap")
 
-    if asks_what_rule and not has_legal_document:
+    if asks_ambiguous_rule_reference and not has_legal_document:
         missing_slots.append("van_ban_phap_luat")
 
     if has_ambiguous_reference and not has_article_reference and has_legal_document:
@@ -141,7 +160,8 @@ def _detect_missing_slots(question: str, config: RoutingConfig) -> list[str]:
     has_any_legal_anchor = any(
         (
             asks_penalty,
-            asks_what_rule,
+            asks_ambiguous_rule_reference,
+            asks_definition_lookup,
             asks_should_sue,
             asks_procedure,
             has_action,

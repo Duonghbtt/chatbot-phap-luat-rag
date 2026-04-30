@@ -22,6 +22,21 @@ from src.tv5_reasoning.prompt_library import (
 LOGGER = logging.getLogger(__name__)
 DEFAULT_LLM_CONFIG_PATH = Path("configs/llm.yaml")
 ENV_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)(?::([^}]*))?\}")
+ARTICLE_REFERENCE_PATTERN = re.compile(r"\bđiều\s+[0-9A-Za-z./-]+\b", re.IGNORECASE)
+DIRECT_LOOKUP_HINTS = (
+    "quy định gì",
+    "là gì",
+    "quyền của",
+    "nghĩa vụ của",
+    "trách nhiệm của",
+    "ai có trách nhiệm",
+)
+CONTRADICTORY_CONTEXT_PHRASES = (
+    "không được đề cập trong ngữ cảnh cung cấp",
+    "chưa được đề cập trong ngữ cảnh cung cấp",
+    "không có trong ngữ cảnh cung cấp",
+    "không được đề cập trong context",
+)
 
 try:
     from langsmith import traceable as _langsmith_traceable
@@ -209,6 +224,126 @@ def _normalize_context(context: str) -> str:
     return re.sub(r"\s+\n", "\n", (context or "").strip())
 
 
+def _normalize_text(text: str) -> str:
+    return re.sub(r"\s+", " ", (text or "").strip())
+
+
+def _has_strong_exact_hit(reranked_docs: Sequence[Mapping[str, Any]] | None) -> bool:
+    for doc in reranked_docs or []:
+        exact_hit_fields = {
+            str(item).strip().lower()
+            for item in (doc.get("exact_hit_fields") or [])
+            if str(item).strip()
+        }
+        matched_filters = {
+            str(key).strip().lower(): str(value).strip()
+            for key, value in dict(doc.get("matched_filters") or {}).items()
+            if str(value).strip()
+        }
+        if "article_code" in exact_hit_fields:
+            return True
+        if "article" in exact_hit_fields and ({"title", "law_id"} & exact_hit_fields):
+            return True
+        if "article_code" in matched_filters:
+            return True
+        if "article" in matched_filters and ("title" in matched_filters or "law_id" in matched_filters):
+            return True
+    return False
+
+
+def _is_direct_legal_lookup(question: str, intent: str) -> bool:
+    normalized_question = _normalize_text(question).lower()
+    if ARTICLE_REFERENCE_PATTERN.search(normalized_question):
+        return True
+    if str(intent).strip().lower() != "hoi_dinh_nghia":
+        return False
+    return any(hint in normalized_question for hint in DIRECT_LOOKUP_HINTS)
+
+
+def _trim_doc_prefixes(content: str, metadata: Mapping[str, Any]) -> str:
+    cleaned = _normalize_text(content)
+    for prefix in (
+        str(metadata.get("article_code") or "").strip(),
+        str(metadata.get("article") or "").strip(),
+        str(metadata.get("article_name") or "").strip(),
+    ):
+        if not prefix:
+            continue
+        escaped = re.escape(_normalize_text(prefix))
+        cleaned = re.sub(rf"^{escaped}[\s.:\-]*", "", cleaned, flags=re.IGNORECASE)
+
+    article_name = _normalize_text(str(metadata.get("article_name") or ""))
+    if article_name:
+        duplicated = f"{article_name} {article_name}"
+        if cleaned.lower().startswith(duplicated.lower()):
+            cleaned = f"{article_name}{cleaned[len(duplicated):]}"
+    return cleaned.strip(" .:-")
+
+
+def _compose_legal_reference(metadata: Mapping[str, Any]) -> str:
+    article_ref = str(metadata.get("article") or metadata.get("article_code") or "").strip()
+    title = str(metadata.get("title") or "").strip()
+    law_id = str(metadata.get("law_id") or "").strip()
+
+    if title and law_id and law_id.lower() not in title.lower():
+        law_ref = f"{title} ({law_id})"
+    else:
+        law_ref = law_id or title
+
+    if article_ref and law_ref:
+        return f"{article_ref} của {law_ref}"
+    return article_ref or law_ref
+
+
+def _build_direct_lookup_answer(
+    *,
+    question: str,
+    intent: str,
+    risk_level: str,
+    reranked_docs: Sequence[Mapping[str, Any]] | None,
+) -> str | None:
+    if str(risk_level).strip().lower() == "high":
+        return None
+    if not _is_direct_legal_lookup(question, intent):
+        return None
+    if not _has_strong_exact_hit(reranked_docs):
+        return None
+
+    for doc in reranked_docs or []:
+        metadata = dict(doc.get("metadata") or {})
+        body = _trim_doc_prefixes(str(doc.get("content") or ""), metadata)
+        reference = _compose_legal_reference(metadata)
+        if not body or not reference:
+            continue
+        return f"Theo {reference}, {body.rstrip('.')}."
+    return None
+
+
+def _post_process_draft_answer(
+    *,
+    draft_answer: str,
+    question: str,
+    intent: str,
+    risk_level: str,
+    reranked_docs: Sequence[Mapping[str, Any]] | None,
+) -> str:
+    direct_lookup_answer = _build_direct_lookup_answer(
+        question=question,
+        intent=intent,
+        risk_level=risk_level,
+        reranked_docs=reranked_docs,
+    )
+    if direct_lookup_answer:
+        return direct_lookup_answer
+
+    cleaned = _normalize_text(draft_answer)
+    lowered = cleaned.lower()
+    for phrase in CONTRADICTORY_CONTEXT_PHRASES:
+        if phrase in lowered:
+            return re.sub(re.escape(phrase), "", cleaned, flags=re.IGNORECASE).strip(" .,-") or cleaned
+    return draft_answer.strip()
+
+
 def _fallback_confidence(context: str, sources: Sequence[str] | None) -> float:
     source_count = len([item for item in (sources or []) if str(item).strip()])
     context_length = len(_normalize_context(context))
@@ -307,6 +442,7 @@ def generate_draft(
     question: str,
     context: str,
     sources: Sequence[str] | None,
+    reranked_docs: Sequence[Mapping[str, Any]] | None,
     intent: str,
     risk_level: str,
     execution_profile: str = "full",
@@ -361,7 +497,15 @@ def generate_draft(
         draft_citations = fallback["draft_citations"]
         draft_confidence = fallback["draft_confidence"]
 
-    citation_report = inspect_citations(draft_answer, normalized_sources, [])
+    draft_answer = _post_process_draft_answer(
+        draft_answer=draft_answer,
+        question=question,
+        intent=intent,
+        risk_level=risk_level,
+        reranked_docs=reranked_docs,
+    )
+
+    citation_report = inspect_citations(draft_answer, normalized_sources, reranked_docs or [])
     if not draft_citations and citation_report["normalized_citations"]:
         draft_citations = citation_report["normalized_citations"]
 
@@ -396,6 +540,7 @@ def generate_draft_node(
     question = str(state.get("normalized_question") or state.get("question") or "").strip()
     context = str(state.get("context") or "").strip()
     sources = list(state.get("sources") or [])
+    reranked_docs = list(state.get("reranked_docs") or [])
     intent = str(state.get("intent") or "hoi_tinh_huong_thuc_te").strip()
     risk_level = str(state.get("risk_level") or "medium").strip().lower()
     execution_profile = resolve_execution_profile(state)
@@ -405,6 +550,7 @@ def generate_draft_node(
         question=question,
         context=context,
         sources=sources,
+        reranked_docs=reranked_docs,
         intent=intent,
         risk_level=risk_level,
         execution_profile=execution_profile,

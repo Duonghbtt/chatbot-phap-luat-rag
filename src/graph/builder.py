@@ -39,6 +39,11 @@ LOGGER = logging.getLogger(__name__)
 DEFAULT_APP_CONFIG_PATH = Path("configs/app.yaml")
 ENV_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)(?::([^}]*))?\}")
 WAITING_USER_INPUT_STATUS = "waiting_user_input"
+BARE_ARTICLE_SOURCE_PATTERN = re.compile(r"^Điều\s+[0-9A-Za-z./-]+\.?$", re.IGNORECASE)
+BARE_LAW_SOURCE_PATTERN = re.compile(
+    r"^(Luật|Bộ luật|Nghị định|Thông tư|Pháp lệnh|Quyết định)\s+số\b",
+    re.IGNORECASE,
+)
 
 try:
     from langsmith import traceable as _langsmith_traceable
@@ -79,6 +84,50 @@ def _optional_traceable(*, name: str, run_type: str = "chain", tags: list[str] |
 def _truncate_preview(value: str, *, max_chars: int = 240) -> str:
     text = normalize_user_text(value)
     return text[:max_chars].strip()
+
+
+def _state_has_strong_exact_legal_hit(state: Mapping[str, Any]) -> bool:
+    for doc in state.get("reranked_docs") or []:
+        exact_hit_fields = {
+            str(item).strip().lower()
+            for item in (doc.get("exact_hit_fields") or [])
+            if str(item).strip()
+        }
+        matched_filters = {
+            str(key).strip().lower(): str(value).strip()
+            for key, value in dict(doc.get("matched_filters") or {}).items()
+            if str(value).strip()
+        }
+        if "article_code" in exact_hit_fields:
+            return True
+        if "article" in exact_hit_fields and ({"title", "law_id"} & exact_hit_fields):
+            return True
+        if "article_code" in matched_filters:
+            return True
+        if "article" in matched_filters and ("title" in matched_filters or "law_id" in matched_filters):
+            return True
+    return False
+
+
+def _prune_display_sources(sources: list[str]) -> list[str]:
+    unique_sources = list(dict.fromkeys(normalize_user_text(item) for item in sources if normalize_user_text(item)))
+    if len(unique_sources) <= 1:
+        return unique_sources
+
+    rich_sources = [item for item in unique_sources if " - " in item or ("," in item and len(item) > 24)]
+    pruned: list[str] = []
+    for source in unique_sources:
+        lowered = source.lower()
+        is_substring = any(lowered != other.lower() and lowered in other.lower() for other in unique_sources)
+        if BARE_ARTICLE_SOURCE_PATTERN.match(source) and rich_sources:
+            continue
+        if BARE_LAW_SOURCE_PATTERN.match(source) and any(lowered in other.lower() for other in rich_sources):
+            continue
+        if is_substring and len(source.split()) <= 4:
+            continue
+        pruned.append(source)
+
+    return pruned or unique_sources[:2]
 
 
 NODE_TRACE_TAGS: dict[str, list[str]] = {
@@ -257,6 +306,11 @@ def _default_human_review_question(state: Mapping[str, Any]) -> str:
 
 
 def _build_waiting_user_input_updates(state: Mapping[str, Any]) -> dict[str, Any]:
+    response_status = str(state.get("response_status") or state.get("status") or "").strip().lower()
+    next_route = str(state.get("next_route") or "").strip().lower()
+    if response_status == "unsupported" or next_route == "unsupported-path" or bool(state.get("unsupported_query")):
+        return {}
+
     interrupt_payload = dict(state.get("interrupt_payload") or {})
     resume_kind = str(state.get("resume_kind") or "").strip()
     if not resume_kind:
@@ -377,8 +431,25 @@ def unsupported_node(state: Mapping[str, Any]) -> dict[str, Any]:
     )
     return {
         "final_answer": answer,
+        "draft_answer": "",
+        "sources": [],
+        "draft_citations": [],
+        "retrieved_docs": [],
+        "reranked_docs": [],
+        "context": "",
+        "citation_findings": {},
         "response_status": "unsupported",
         "status": "unsupported",
+        "unsupported_query": True,
+        "need_clarify": False,
+        "clarify_question": "",
+        "clarify_reason": "",
+        "missing_slots": [],
+        "human_review_required": False,
+        "review_note": "",
+        "resume_kind": "",
+        "resume_question": "",
+        "interrupt_payload": None,
         "next_action": "proceed",
     }
 
@@ -416,11 +487,24 @@ def retrieval_fallback_node(state: Mapping[str, Any]) -> dict[str, Any]:
 def citation_format_node(state: Mapping[str, Any]) -> dict[str, Any]:
     """Normalize citation display without changing the legal substance of the answer."""
 
+    response_status = str(state.get("response_status") or state.get("status") or "").strip().lower()
+    if response_status == "unsupported" or bool(state.get("unsupported_query")):
+        return {
+            "sources": [],
+            "citation_findings": {},
+        }
+
     sources: list[str] = []
     for source in state.get("sources") or []:
         cleaned = normalize_user_text(str(source))
         if cleaned and cleaned not in sources:
             sources.append(cleaned)
+
+    if not sources and not list(state.get("reranked_docs") or []):
+        return {
+            "sources": [],
+            "citation_findings": dict(state.get("citation_findings") or {}),
+        }
 
     citation_findings = dict(state.get("citation_findings") or {})
     if not citation_findings:
@@ -436,8 +520,11 @@ def citation_format_node(state: Mapping[str, Any]) -> dict[str, Any]:
         if normalize_user_text(str(item))
     ]
     if normalized_citations:
-        sources = list(dict.fromkeys(normalized_citations + sources))
-    if str(state.get("execution_profile") or "").strip().lower() == "fast":
+        sources = sources + [item for item in normalized_citations if item not in sources]
+    sources = _prune_display_sources(sources)
+    if _state_has_strong_exact_legal_hit(state):
+        sources = sources[:2]
+    elif str(state.get("execution_profile") or "").strip().lower() == "fast":
         sources = sources[:2]
     return {
         "sources": sources,

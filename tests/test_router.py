@@ -168,6 +168,17 @@ def test_route_to_legal_agent_path(rule_config: RoutingConfig) -> None:
     assert result["unsupported_query"] is False
 
 
+def test_definition_question_without_explicit_law_does_not_force_clarify(rule_config: RoutingConfig) -> None:
+    state = {
+        "question": "Quyền của thanh niên là gì?",
+        "normalized_question": "Quyền của thanh niên là gì?",
+    }
+    result = route_node(state, routing_config=rule_config)
+    assert result["next_route"] in {"legal-agent-path", "fast-path"}
+    assert result["need_clarify"] is False
+    assert result["clarify_question"] == ""
+
+
 def test_route_to_unsupported_path(rule_config: RoutingConfig) -> None:
     state = {
         "question": "Hôm nay thời tiết ở Hà Nội thế nào?",
@@ -176,6 +187,8 @@ def test_route_to_unsupported_path(rule_config: RoutingConfig) -> None:
     result = route_node(state, routing_config=rule_config)
     assert result["next_route"] == "unsupported-path"
     assert result["unsupported_query"] is True
+    assert result["need_clarify"] is False
+    assert result["clarify_question"] == ""
 
 
 def test_route_to_human_review_path(rule_config: RoutingConfig) -> None:

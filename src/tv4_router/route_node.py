@@ -270,15 +270,16 @@ def route_node(
         fast_path_enabled = True
 
     unsupported_query = unsupported_result["unsupported_query"] if next_route == "unsupported-path" else False
+    should_clear_clarify = next_route == "unsupported-path"
 
     return {
         "intent": intent_result["intent"],
         "intent_score": intent_result["score"],
         "top_intents": intent_result["top_labels"],
-        "need_clarify": clarify_result["need_clarify"],
-        "clarify_reason": clarify_result["reason"],
-        "clarify_question": clarify_result["clarify_question"],
-        "missing_slots": list(clarify_result.get("missing_slots") or []),
+        "need_clarify": False if should_clear_clarify else clarify_result["need_clarify"],
+        "clarify_reason": "" if should_clear_clarify else clarify_result["reason"],
+        "clarify_question": "" if should_clear_clarify else clarify_result["clarify_question"],
+        "missing_slots": [] if should_clear_clarify else list(clarify_result.get("missing_slots") or []),
         "risk_level": risk_result["risk_level"],
         "risk_reason": risk_result["risk_reason"],
         "next_route": next_route,

@@ -173,6 +173,89 @@ def _safe_float(value: Any, default: float) -> float:
         return default
 
 
+def _has_strong_exact_legal_hit(reranked_docs: Sequence[Mapping[str, Any]] | None) -> bool:
+    for doc in reranked_docs or []:
+        exact_hit_fields = {
+            str(item).strip().lower()
+            for item in (doc.get("exact_hit_fields") or [])
+            if str(item).strip()
+        }
+        matched_filters = {
+            str(key).strip().lower(): str(value).strip()
+            for key, value in dict(doc.get("matched_filters") or {}).items()
+            if str(value).strip()
+        }
+        if "article_code" in exact_hit_fields:
+            return True
+        if "article" in exact_hit_fields and ({"title", "law_id"} & exact_hit_fields):
+            return True
+        if "article_code" in matched_filters:
+            return True
+        if "article" in matched_filters and ("title" in matched_filters or "law_id" in matched_filters):
+            return True
+    return False
+
+
+def _is_low_risk_definition_overview(
+    *,
+    question: str,
+    intent: str,
+    risk_level: str,
+    sources: Sequence[str] | None,
+    reranked_docs: Sequence[Mapping[str, Any]] | None,
+) -> bool:
+    if str(risk_level).strip().lower() not in {"low", "medium"}:
+        return False
+    if str(intent).strip().lower() != "hoi_dinh_nghia":
+        return False
+    normalized_question = str(question or "").strip().lower()
+    if any(marker in normalized_question for marker in ("tôi", "em", "gia đình", "công ty", "trường hợp", "nếu")):
+        return False
+    source_count = len([item for item in (sources or []) if str(item).strip()])
+    doc_count = len([doc for doc in (reranked_docs or []) if doc])
+    return source_count >= 2 and doc_count >= 2
+
+
+def _resolve_low_risk_exact_hit_next_action(
+    *,
+    question: str,
+    intent: str,
+    risk_level: str,
+    current_next_action: str,
+    grounding_score: float,
+    unsupported_claims: Sequence[str],
+    sources: Sequence[str] | None,
+    reranked_docs: Sequence[Mapping[str, Any]] | None,
+) -> str:
+    normalized_risk = str(risk_level).strip().lower()
+    if normalized_risk == "high":
+        return current_next_action
+    if current_next_action != "human_review":
+        return current_next_action
+
+    if _has_strong_exact_legal_hit(reranked_docs):
+        if unsupported_claims:
+            return "revise"
+        if grounding_score >= 0.5:
+            return "proceed"
+        return "revise"
+
+    if _is_low_risk_definition_overview(
+        question=question,
+        intent=intent,
+        risk_level=normalized_risk,
+        sources=sources,
+        reranked_docs=reranked_docs,
+    ):
+        if unsupported_claims:
+            return "revise"
+        if grounding_score >= 0.75:
+            return "proceed"
+        return "revise"
+
+    return current_next_action
+
+
 def rule_based_grounding_check(
     *,
     draft_answer: str,
@@ -316,6 +399,16 @@ def grounding_check_node(
         merged_next_action = str(llm_result.get("next_action") or rule_based["next_action"])
         if risk_level == "high" and merged_next_action == "proceed" and merged_score < 0.8:
             merged_next_action = "human_review"
+        merged_next_action = _resolve_low_risk_exact_hit_next_action(
+            question=question,
+            intent=intent,
+            risk_level=risk_level,
+            current_next_action=merged_next_action,
+            grounding_score=merged_score,
+            unsupported_claims=merged_unsupported,
+            sources=sources,
+            reranked_docs=reranked_docs,
+        )
         rule_based.update(
             {
                 "grounding_score": merged_score,
@@ -331,9 +424,20 @@ def grounding_check_node(
             }
         )
 
-    human_review_required = bool(state.get("human_review_required") or False)
-    review_note = str(state.get("review_note") or "").strip()
-    next_action = str(rule_based["next_action"] or "")
+    human_review_required = False
+    review_note = ""
+    next_action = _resolve_low_risk_exact_hit_next_action(
+        question=question,
+        intent=intent,
+        risk_level=risk_level,
+        current_next_action=str(rule_based["next_action"] or ""),
+        grounding_score=float(rule_based["grounding_score"] or 0.0),
+        unsupported_claims=rule_based["unsupported_claims"],
+        sources=sources,
+        reranked_docs=reranked_docs,
+    )
+    rule_based["next_action"] = next_action
+    rule_based["grounding_ok"] = next_action == "proceed"
 
     if execution_profile == "fast":
         human_review_required = False
@@ -346,6 +450,8 @@ def grounding_check_node(
         human_review_required = True
         review_note = review_note or (
             "Grounding chưa đủ mạnh cho câu hỏi rủi ro cao; nên có human review trước khi trả lời chính thức."
+            if risk_level == "high"
+            else "Grounding hoặc trích dẫn chưa đủ chắc chắn; nên có human review trước khi trả lời chính thức."
         )
 
     return {

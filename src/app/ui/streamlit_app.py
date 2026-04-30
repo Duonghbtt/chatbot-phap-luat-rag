@@ -4,6 +4,7 @@ import json
 import logging
 import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping
 from urllib import error, request
@@ -13,6 +14,8 @@ import streamlit as st
 LOGGER = logging.getLogger(__name__)
 DEFAULT_APP_CONFIG_PATH = Path("configs/app.yaml")
 WAITING_USER_INPUT_STATUS = "waiting_user_input"
+DEFAULT_CHECKPOINTS_DIR = Path(".checkpoints")
+MAX_LOCAL_CONVERSATIONS = 30
 
 
 @dataclass(slots=True, frozen=True)
@@ -26,6 +29,17 @@ class AppUIConfig:
     page_icon: str = "\u2696\ufe0f"
     app_title: str = "Hệ thống hỏi đáp pháp luật đa tác tử"
     app_subtitle: str = "LangGraph agentic mức 3 - Router, Retrieval, Grounding, Review"
+
+
+@dataclass(slots=True, frozen=True)
+class LocalConversationSummary:
+    session_id: str
+    thread_id: str
+    updated_at: str
+    title: str
+    status: str
+    resume_kind: str
+    file_path: Path
 
 
 def _load_yaml_module() -> Any:
@@ -105,6 +119,186 @@ def _new_id(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4()}"
 
 
+def _truncate_text(text: str, *, max_chars: int = 72) -> str:
+    normalized = " ".join(str(text or "").split())
+    if len(normalized) <= max_chars:
+        return normalized
+    return f"{normalized[: max_chars - 3].rstrip()}..."
+
+
+def _parse_iso_datetime(raw_value: str) -> datetime:
+    value = str(raw_value or "").strip()
+    if not value:
+        return datetime.min
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return datetime.min
+
+
+def _status_label(status: str, resume_kind: str = "") -> str:
+    normalized_status = str(status or "").strip() or "unknown"
+    if normalized_status == WAITING_USER_INPUT_STATUS and resume_kind:
+        return f"{normalized_status} ({resume_kind})"
+    return normalized_status
+
+
+def _conversation_title_from_state(state: Mapping[str, Any], thread_id: str) -> str:
+    question = str(state.get("question") or state.get("normalized_question") or "").strip()
+    if question:
+        return _truncate_text(question)
+
+    history = list(state.get("history") or [])
+    for item in history:
+        if not isinstance(item, Mapping):
+            continue
+        if str(item.get("role") or "") == "user":
+            content = str(item.get("content") or "").strip()
+            if content:
+                return _truncate_text(content)
+    return thread_id
+
+
+def _load_local_conversations(
+    *,
+    base_dir: str | Path = DEFAULT_CHECKPOINTS_DIR,
+    limit: int = MAX_LOCAL_CONVERSATIONS,
+) -> list[LocalConversationSummary]:
+    resolved_base_dir = Path(base_dir).resolve()
+    if not resolved_base_dir.exists():
+        return []
+
+    summaries: list[LocalConversationSummary] = []
+    for checkpoint_path in resolved_base_dir.glob("*/*.json"):
+        try:
+            payload = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            LOGGER.warning("Skipping unreadable checkpoint file %s: %s", checkpoint_path, exc)
+            continue
+        if not isinstance(payload, Mapping):
+            continue
+        state = payload.get("state") or {}
+        if not isinstance(state, Mapping):
+            continue
+
+        session_id = str(payload.get("session_id") or state.get("session_id") or checkpoint_path.parent.name).strip()
+        thread_id = str(payload.get("thread_id") or state.get("thread_id") or checkpoint_path.stem).strip()
+        updated_at = str(payload.get("updated_at") or "").strip()
+        status = str(state.get("response_status") or state.get("status") or "ok").strip()
+        resume_kind = str(state.get("resume_kind") or "").strip()
+        summaries.append(
+            LocalConversationSummary(
+                session_id=session_id,
+                thread_id=thread_id,
+                updated_at=updated_at,
+                title=_conversation_title_from_state(state, thread_id),
+                status=status,
+                resume_kind=resume_kind,
+                file_path=checkpoint_path,
+            )
+        )
+
+    summaries.sort(key=lambda item: (_parse_iso_datetime(item.updated_at), item.thread_id), reverse=True)
+    return summaries[: max(1, limit)]
+
+
+def _load_checkpoint_state_from_file(file_path: str | Path) -> dict[str, Any]:
+    payload = json.loads(Path(file_path).resolve().read_text(encoding="utf-8"))
+    if not isinstance(payload, Mapping):
+        raise ValueError(f"Checkpoint file has invalid structure: {file_path}")
+    state = payload.get("state") or {}
+    if not isinstance(state, Mapping):
+        raise ValueError(f"Checkpoint file missing `state`: {file_path}")
+    return dict(state)
+
+
+def _history_entry_to_message(entry: Mapping[str, Any]) -> dict[str, Any] | None:
+    role = str(entry.get("role") or "").strip()
+    content = str(entry.get("content") or "").strip()
+    if not role or not content:
+        return None
+
+    if role == "assistant":
+        metadata = dict(entry.get("metadata") or {})
+        payload: dict[str, Any] = {}
+        if metadata.get("status"):
+            payload["status"] = metadata.get("status")
+        return {"role": "assistant", "content": content, "payload": payload}
+
+    if role in {"user", "human_reviewer"}:
+        return {"role": "user", "content": content, "payload": {}}
+
+    return None
+
+
+def _build_messages_from_checkpoint_state(state: Mapping[str, Any]) -> list[dict[str, Any]]:
+    messages: list[dict[str, Any]] = []
+    history = list(state.get("history") or [])
+    for raw_entry in history:
+        if not isinstance(raw_entry, Mapping):
+            continue
+        converted = _history_entry_to_message(raw_entry)
+        if converted:
+            messages.append(converted)
+
+    normalized_payload = normalize_backend_response(state)["payload"]
+    pending_messages = _build_assistant_messages_from_payload(normalized_payload)
+    if str(normalized_payload.get("status") or "") == WAITING_USER_INPUT_STATUS:
+        for pending_message in pending_messages:
+            pending_content = str(pending_message.get("content") or "").strip()
+            if not pending_content:
+                continue
+            if (
+                not messages
+                or messages[-1].get("role") != "assistant"
+                or str(messages[-1].get("content") or "").strip() != pending_content
+            ):
+                messages.append(pending_message)
+    else:
+        for pending_message in pending_messages:
+            assistant_text = str(pending_message.get("content") or "").strip()
+            if not assistant_text:
+                continue
+            for message in reversed(messages):
+                if message.get("role") == "assistant" and str(message.get("content") or "").strip() == assistant_text:
+                    merged_payload = dict(message.get("payload") or {})
+                    merged_payload.update(dict(pending_message.get("payload") or {}))
+                    message["payload"] = merged_payload
+                    break
+            else:
+                messages.append(pending_message)
+
+    return messages
+
+def _restore_conversation_from_checkpoint_state(state: Mapping[str, Any]) -> None:
+    normalized_response = normalize_backend_response(state)
+    payload = dict(normalized_response["payload"])
+    st.session_state["messages"] = _build_messages_from_checkpoint_state(state)
+    st.session_state["session_id_value"] = str(state.get("session_id") or st.session_state.get("session_id_value") or "")
+    st.session_state["thread_id_value"] = str(state.get("thread_id") or st.session_state.get("thread_id_value") or "")
+    st.session_state["last_response"] = payload
+    st.session_state["pending_resume"] = _is_resume_required(payload)
+    st.session_state["pending_resume_kind"] = str(payload.get("resume_kind") or "")
+    st.session_state["pending_resume_question"] = str(payload.get("resume_question") or "")
+    st.session_state["pending_resume_note_value"] = ""
+    st.session_state["refresh_control_inputs"] = True
+
+
+def _format_local_conversation_timestamp(updated_at: str) -> str:
+    parsed = _parse_iso_datetime(updated_at)
+    if parsed == datetime.min:
+        return ""
+    return parsed.strftime("%Y-%m-%d %H:%M")
+
+
+def _format_local_conversation_option(summary: LocalConversationSummary) -> str:
+    status_text = _status_label(summary.status, summary.resume_kind)
+    timestamp = _format_local_conversation_timestamp(summary.updated_at)
+    if timestamp:
+        return f"[{status_text}] {summary.title} — {timestamp}"
+    return f"[{status_text}] {summary.title}"
+
+
 def _sync_control_values_from_inputs() -> None:
     """Copy sidebar widget inputs into stable non-widget session state."""
 
@@ -112,6 +306,7 @@ def _sync_control_values_from_inputs() -> None:
     st.session_state["thread_id_value"] = str(st.session_state.get("thread_id_input") or "").strip()
     st.session_state["api_base_url_value"] = str(st.session_state.get("api_base_url_input") or "").strip()
     st.session_state["use_stream_endpoint_value"] = bool(st.session_state.get("use_stream_endpoint_input"))
+    st.session_state["pending_resume_note_value"] = str(st.session_state.get("pending_resume_note_input") or "")
 
 
 def _sync_inputs_from_control_values() -> None:
@@ -121,6 +316,7 @@ def _sync_inputs_from_control_values() -> None:
     st.session_state["thread_id_input"] = str(st.session_state.get("thread_id_value") or "")
     st.session_state["api_base_url_input"] = str(st.session_state.get("api_base_url_value") or "")
     st.session_state["use_stream_endpoint_input"] = bool(st.session_state.get("use_stream_endpoint_value"))
+    st.session_state["pending_resume_note_input"] = str(st.session_state.get("pending_resume_note_value") or "")
 
 
 def init_session_state(config: AppUIConfig) -> None:
@@ -140,13 +336,15 @@ def init_session_state(config: AppUIConfig) -> None:
     st.session_state.setdefault("pending_resume", False)
     st.session_state.setdefault("pending_resume_kind", "")
     st.session_state.setdefault("pending_resume_question", "")
-    st.session_state.setdefault("pending_resume_note", "")
+    st.session_state.setdefault("pending_resume_note_value", str(st.session_state.get("pending_resume_note") or ""))
     st.session_state.setdefault("last_response", {})
+    st.session_state.setdefault("local_conversation_file", "")
     st.session_state.setdefault("refresh_control_inputs", False)
     st.session_state.setdefault("session_id_input", st.session_state["session_id_value"])
     st.session_state.setdefault("thread_id_input", st.session_state["thread_id_value"])
     st.session_state.setdefault("api_base_url_input", st.session_state["api_base_url_value"])
     st.session_state.setdefault("use_stream_endpoint_input", st.session_state["use_stream_endpoint_value"])
+    st.session_state.setdefault("pending_resume_note_input", st.session_state["pending_resume_note_value"])
     if st.session_state.pop("refresh_control_inputs", False):
         _sync_inputs_from_control_values()
 
@@ -159,7 +357,7 @@ def reset_conversation() -> None:
     st.session_state["pending_resume"] = False
     st.session_state["pending_resume_kind"] = ""
     st.session_state["pending_resume_question"] = ""
-    st.session_state["pending_resume_note"] = ""
+    st.session_state["pending_resume_note_value"] = ""
     st.session_state["last_response"] = {}
     st.session_state["refresh_control_inputs"] = True
 
@@ -326,20 +524,65 @@ def stream_chat_api(
     yield from _stream_json_events(endpoint, payload=payload, timeout_seconds=timeout_seconds)
 
 
-def _extract_answer_text(payload: Mapping[str, Any]) -> str:
-    """Choose the best answer field while keeping `/chat` compatibility."""
-
+def _extract_response_body_text(payload: Mapping[str, Any]) -> str:
     return str(
         payload.get("final_answer")
         or payload.get("answer")
         or payload.get("draft_answer")
-        or payload.get("resume_question")
         or payload.get("clarify_question")
         or payload.get("review_note")
         or payload.get("message")
         or "Hệ thống chưa trả về nội dung trả lời."
     )
 
+
+def _extract_waiting_prompt_text(payload: Mapping[str, Any]) -> str:
+    status = str(payload.get("status") or payload.get("response_status") or "").strip()
+    if status != WAITING_USER_INPUT_STATUS:
+        return ""
+    return str(payload.get("resume_question") or "").strip()
+
+
+def _extract_answer_text(payload: Mapping[str, Any]) -> str:
+    """Choose the best answer field while keeping `/chat` compatibility."""
+
+    waiting_prompt = _extract_waiting_prompt_text(payload)
+    if waiting_prompt:
+        return waiting_prompt
+    return _extract_response_body_text(payload)
+
+
+def _build_draft_assistant_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
+    draft_payload = dict(payload)
+    draft_payload.pop("resume_kind", None)
+    draft_payload.pop("resume_question", None)
+    if str(draft_payload.get("status") or "").strip() == WAITING_USER_INPUT_STATUS:
+        draft_payload["status"] = "draft"
+        draft_payload["response_status"] = "draft"
+    return draft_payload
+
+
+def _build_assistant_messages_from_payload(payload: Mapping[str, Any]) -> list[dict[str, Any]]:
+    normalized_payload = dict(payload)
+    body_text = _extract_response_body_text(normalized_payload).strip()
+    waiting_prompt = _extract_waiting_prompt_text(normalized_payload)
+    default_text = "Hệ thống chưa trả về nội dung trả lời."
+    messages: list[dict[str, Any]] = []
+
+    if body_text and body_text != default_text and body_text != waiting_prompt:
+        body_payload = _build_draft_assistant_payload(normalized_payload) if waiting_prompt else dict(normalized_payload)
+        messages.append({"role": "assistant", "content": body_text, "payload": body_payload})
+
+    if waiting_prompt:
+        prompt_payload = dict(normalized_payload)
+        prompt_payload["assistant_prompt_kind"] = str(normalized_payload.get("resume_kind") or "waiting_user_input")
+        messages.append({"role": "assistant", "content": waiting_prompt, "payload": prompt_payload})
+
+    if not messages:
+        fallback_text = waiting_prompt or body_text or default_text
+        messages.append({"role": "assistant", "content": fallback_text, "payload": dict(normalized_payload)})
+
+    return messages
 
 def _build_stream_fallback_payload(
     question: str,
@@ -619,8 +862,15 @@ def render_message(message: Mapping[str, Any]) -> None:
                 st.caption(f"Intent: {payload.get('intent')} | Score: {payload.get('intent_score', '')}")
             if payload.get("route_reason"):
                 st.caption(f"Lý do route: {payload.get('route_reason')}")
-            if payload.get("review_note") and payload.get("status") != WAITING_USER_INPUT_STATUS:
-                st.warning(str(payload.get("review_note")))
+            waiting_prompt = _extract_waiting_prompt_text(payload)
+            if waiting_prompt:
+                resume_kind = str(payload.get("resume_kind") or "user_input").strip()
+                display_kind = "human review" if resume_kind == "human_review" else resume_kind
+                st.info(f"Đang chờ {display_kind}. Hãy trả lời ngay trong ô chat để hệ thống tiếp tục.")
+            if payload.get("review_note"):
+                review_note = str(payload.get("review_note"))
+                if not waiting_prompt or review_note.strip() != content.strip():
+                    st.warning(review_note)
             if payload.get("ui_notice"):
                 st.info(str(payload.get("ui_notice")))
             if payload.get("event_trace"):
@@ -632,7 +882,6 @@ def render_message(message: Mapping[str, Any]) -> None:
                     f"OK: {payload.get('grounding_ok')} | Next: {payload.get('next_action')}"
                 )
             render_sources(payload.get("sources") or [])
-
 
 def render_chat_history() -> None:
     for message in st.session_state["messages"]:
@@ -736,7 +985,7 @@ def _store_response_state(payload: Mapping[str, Any]) -> None:
     if not st.session_state["pending_resume"]:
         st.session_state["pending_resume_kind"] = ""
         st.session_state["pending_resume_question"] = ""
-        st.session_state["pending_resume_note"] = ""
+        st.session_state["pending_resume_note_value"] = ""
 
 
 def submit_question(config: AppUIConfig, question: str) -> None:
@@ -789,9 +1038,13 @@ def submit_question(config: AppUIConfig, question: str) -> None:
         return
 
     normalized_response = normalize_backend_response(response_payload)
-    append_message("assistant", normalized_response["answer"], payload=normalized_response["payload"])
+    for assistant_message in _build_assistant_messages_from_payload(normalized_response["payload"]):
+        append_message(
+            "assistant",
+            str(assistant_message.get("content") or ""),
+            payload=assistant_message.get("payload"),
+        )
     _store_response_state(normalized_response["payload"])
-
 
 def submit_resume(config: AppUIConfig, note: str) -> None:
     _sync_control_values_from_inputs()
@@ -814,9 +1067,13 @@ def submit_resume(config: AppUIConfig, note: str) -> None:
         return
 
     normalized_response = normalize_backend_response(response)
-    append_message("assistant", normalized_response["answer"], payload=normalized_response["payload"])
+    for assistant_message in _build_assistant_messages_from_payload(normalized_response["payload"]):
+        append_message(
+            "assistant",
+            str(assistant_message.get("content") or ""),
+            payload=assistant_message.get("payload"),
+        )
     _store_response_state(normalized_response["payload"])
-
 
 def render_sidebar(config: AppUIConfig) -> None:
     with st.sidebar:
@@ -831,6 +1088,38 @@ def render_sidebar(config: AppUIConfig) -> None:
         if st.button("Tạo phiên mới"):
             reset_conversation()
             st.rerun()
+
+        st.subheader("Hội thoại cũ (local)")
+        local_conversations = _load_local_conversations()
+        if not local_conversations:
+            st.caption("Chưa tìm thấy checkpoint nào trong `.checkpoints`.")
+        else:
+            option_ids = [str(item.file_path) for item in local_conversations]
+            option_labels = {str(item.file_path): _format_local_conversation_option(item) for item in local_conversations}
+            if st.session_state.get("local_conversation_file") not in option_ids:
+                st.session_state["local_conversation_file"] = option_ids[0]
+
+            selected_file = st.selectbox(
+                "Chọn cuộc trò chuyện đã lưu",
+                options=option_ids,
+                format_func=lambda option_id: option_labels.get(option_id, option_id),
+                key="local_conversation_file",
+            )
+            selected_summary = next(
+                (item for item in local_conversations if str(item.file_path) == str(selected_file)),
+                None,
+            )
+            if selected_summary is not None:
+                st.caption(f"session_id: {selected_summary.session_id}")
+                st.caption(f"thread_id: {selected_summary.thread_id}")
+                if st.button("Mở hội thoại đã chọn"):
+                    try:
+                        checkpoint_state = _load_checkpoint_state_from_file(selected_summary.file_path)
+                    except Exception as exc:
+                        st.error(f"Không thể đọc checkpoint: {exc}")
+                    else:
+                        _restore_conversation_from_checkpoint_state(checkpoint_state)
+                        st.rerun()
 
         last_response = st.session_state.get("last_response") or {}
         if last_response:
@@ -849,9 +1138,10 @@ def render_sidebar(config: AppUIConfig) -> None:
                 st.caption(str(st.session_state.get("pending_resume_question")))
             note = st.text_area(
                 "Nội dung bổ sung / xác nhận",
-                key="pending_resume_note",
+                key="pending_resume_note_input",
                 placeholder="Chỉ dùng khi cần debug thủ công luồng /chat/resume...",
             )
+            st.session_state["pending_resume_note_value"] = str(note or "")
             if st.button("Gửi resume (debug)"):
                 submit_resume(config, note)
                 st.rerun()

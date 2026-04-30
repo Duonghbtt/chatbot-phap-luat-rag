@@ -303,6 +303,52 @@ def _invoke_review_interrupt(runtime: Any, *, question: str, thread_id: str, ses
     return runtime.invoke(initial_state)
 
 
+def test_unsupported_route_is_not_overridden_by_clarify_waiting_state() -> None:
+    def fake_unsupported_route_node(state: Mapping[str, Any]) -> dict[str, Any]:
+        return {
+            "intent": "hoi_tinh_huong_thuc_te",
+            "intent_score": 0.82,
+            "risk_level": "medium",
+            "need_clarify": True,
+            "clarify_reason": "muc_tieu_tra_loi",
+            "clarify_question": "Bạn muốn hệ thống tập trung vào nội dung pháp luật nào?",
+            "missing_slots": ["muc_tieu_tra_loi"],
+            "unsupported_query": True,
+            "next_route": "unsupported-path",
+            "route_reason": "Câu hỏi có dấu hiệu nằm ngoài phạm vi hỗ trợ pháp luật của hệ thống.",
+            "status": "",
+            "response_status": "",
+            "resume_kind": "",
+            "resume_question": "",
+        }
+
+    runtime, _ = _make_runtime(
+        dependencies=GraphDependencies(
+            route_node=fake_unsupported_route_node,
+            human_review_node=human_review_node,
+        )
+    )
+
+    state = runtime.invoke(
+        create_initial_state(
+            question="Thời tiết Hà Nội hôm nay thế nào?",
+            thread_id="thread-unsupported-001",
+            session_id="session-unsupported-001",
+        )
+    )
+
+    assert state["next_route"] == "unsupported-path"
+    assert state["unsupported_query"] is True
+    assert state["response_status"] == "unsupported"
+    assert state["status"] == "unsupported"
+    assert state["resume_kind"] == ""
+    assert state["resume_question"] == ""
+    assert state["interrupt_payload"] is None
+    assert state["sources"] == []
+    assert state["citation_findings"] == {}
+    assert "ngoài phạm vi" in str(state["final_answer"]).lower()
+
+
 def test_interrupt_when_human_review_required() -> None:
     trace = _make_trace()
     runtime, store = _make_runtime(dependencies=_build_post_reasoning_dependencies(trace))
