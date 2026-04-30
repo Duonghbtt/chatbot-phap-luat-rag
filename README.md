@@ -1,502 +1,571 @@
-# Hệ thống Hỏi Đáp Văn Bản Pháp Luật Đa Tác Tử dùng RAG và LangGraph
+# Hệ thống Hỏi đáp Văn bản Pháp luật đa tác tử dùng RAG và LangGraph
 
-> Báo cáo cập nhật theo kiến trúc hiện tại của hệ thống.  
-> Stack chính: **LangGraph + Hybrid Retrieval + Qdrant + FastAPI + Streamlit**.
+> README này mô tả đúng trạng thái code hiện tại của repo `Vietnamese Legal QA RAG`.
+> Stack chính: `LangGraph + FastAPI + Streamlit + Qdrant + Ollama + Hybrid Retrieval`.
 
-## 1. Giới thiệu
+## 1. Tổng quan
 
-Dự án xây dựng một hệ thống hỏi đáp văn bản pháp luật tiếng Việt theo kiến trúc agentic mức 3. Hệ thống không chỉ truy xuất tài liệu và sinh câu trả lời, mà còn:
+Đây là hệ thống hỏi đáp pháp luật tiếng Việt theo kiến trúc agentic mức 3. Hệ thống không chỉ truy xuất tài liệu và sinh câu trả lời, mà còn có thể:
 
-- phân tích câu hỏi để xác định intent và mức rủi ro,
-- chọn nhánh xử lý phù hợp giữa `fast-path`, `legal-agent-path`, `clarify-path`, `human-review-path`, `unsupported-path`,
-- dùng checkpoint để dừng và tiếp tục hội thoại theo `thread_id` và `session_id`,
-- hỗ trợ cơ chế hỏi ngược lại trong chat khi thiếu dữ kiện hoặc cần xác nhận phạm vi trả lời,
-- stream event backend theo thời gian thực qua SSE.
+- phân loại intent câu hỏi,
+- gán mức rủi ro pháp lý,
+- route sang nhiều nhánh xử lý khác nhau,
+- chạy retrieval loop và reasoning loop,
+- dừng để `clarify` hoặc `human_review`,
+- lưu checkpoint theo `thread_id` và `session_id`,
+- resume cuộc hội thoại qua `/chat/resume`,
+- stream trace backend ra UI bằng SSE.
 
-Khác với pipeline RAG tuyến tính, phiên bản hiện tại tách rõ:
+## 2. Kiến trúc hiện tại
 
-- **fast-path** cho câu hỏi đơn giản, low-risk, xử lý nhẹ và nhanh,
-- **legal-agent-path** cho câu hỏi pháp lý đầy đủ hoặc phức tạp, có retry và revise loop,
-- **waiting_user_input** cho các trường hợp cần người dùng trả lời tiếp ngay trong khung chat.
+### 2.1 Các tầng chính
 
-## 2. Mục tiêu hệ thống
+- `TV1 - Data ingest`: parse snapshot Bộ pháp điển điện tử và chuẩn hóa dữ liệu.
+- `TV2 - Indexing`: build article-level index vào Qdrant.
+- `TV3 - Retrieval`: rewrite query, retrieve, rerank, retrieval check, fallback policy.
+- `TV4 - Router`: intent classifier, clarify detector, risk tagger, route node.
+- `TV5 - Reasoning`: generate draft, grounding check, revise answer, citation critic.
+- `TV6 - Orchestration`: LangGraph runtime, checkpointing, interrupt/resume, FastAPI routes.
+- `UI`: Streamlit chat frontend.
 
-- Xây dựng quy trình ingest, chuẩn hóa và lập chỉ mục văn bản pháp luật.
-- Tổ chức retrieval theo Hybrid Search giữa BM25 và vector search.
-- Điều phối toàn bộ hệ thống bằng `LangGraph` với `AgentState` dùng chung.
-- Tách execution policy giữa fast-path và full legal path để giảm độ trễ.
-- Hỗ trợ `interrupt/resume` qua `checkpoint` cho clarify và human-in-the-loop.
-- Cung cấp backend `FastAPI` và frontend `Streamlit` để chạy hội thoại thực tế.
-
-## 3. Kiến trúc agentic hiện tại
-
-### 3.1 Thành phần chính
-
-- **TV1 - Data**: ingest, parse, chunk văn bản pháp luật.
-- **TV2 - Index**: embedding, Qdrant index, collection lifecycle.
-- **TV3 - Retrieval**: rewrite query, retrieve, rerank, retrieval check, fallback policy.
-- **TV4 - Router**: intent classification, risk tagging, clarify detection, route decision.
-- **TV5 - Reasoning**: generate draft, grounding check, revise answer, citation critic.
-- **TV6 - Orchestration**: LangGraph builder, subgraph, checkpointing, FastAPI, streaming, resume.
-
-### 3.2 Luồng tổng quát của hệ thống
+### 2.2 Luồng tổng quát
 
 ```mermaid
 flowchart TD
-    A["User hỏi"] --> B["analyze_node"]
-    B --> C["route_node"]
+    A["User / Streamlit"] --> B["/chat hoặc /chat/stream"]
+    B --> C["LegalQAGraphRuntime"]
+    C --> D["analyze_node"]
+    D --> E["route_node"]
 
-    C -->|"clarify-path"| D["waiting_user_input<br/>resume_kind=clarify"]
-    C -->|"human-review-path"| E["waiting_user_input<br/>resume_kind=human_review"]
-    C -->|"unsupported-path"| F["unsupported_node"]
-    C -->|"fast-path"| G["Fast Path"]
-    C -->|"legal-agent-path"| H["Full Legal Path"]
+    E -->|"clarify-path"| F["waiting_user_input (clarify)"]
+    E -->|"human-review-path"| G["waiting_user_input (human_review)"]
+    E -->|"unsupported-path"| H["unsupported_node"]
+    E -->|"fast-path"| I["fast retrieval + fast reasoning"]
+    E -->|"legal-agent-path"| J["full retrieval loop + reasoning loop"]
 
-    D -->|"user trả lời tiếp<br/>/chat/resume"| I["resume clarify"]
-    E -->|"user trả lời tiếp<br/>/chat/resume"| J["resume human review"]
+    F -->|"/chat/resume"| C
+    G -->|"/chat/resume"| C
 
-    I --> C
-    J --> H
-
-    G --> K["citation_format_node"]
+    I -->|"escalate_to_full nếu cần"| J
+    I --> K["citation_format_node"]
+    J --> K
     H --> K
-    F --> K
     K --> L["final_answer_node"]
-    L --> M["API response / SSE final_state"]
+    L --> M["JSON response / SSE events"]
 ```
 
-Luồng hiện tại có 5 nhánh ở `route_node`:
+### 2.3 Các route hiện có
 
-- `clarify-path`: thiếu dữ kiện quan trọng, cần hỏi ngược lại.
-- `human-review-path`: câu hỏi rủi ro cao, cần xác nhận phạm vi trả lời.
-- `unsupported-path`: ngoài phạm vi pháp luật mà hệ thống hỗ trợ.
-- `fast-path`: câu hỏi trực tiếp, low-risk, có thể trả lời nhanh.
+- `clarify-path`: câu hỏi thiếu dữ kiện pháp lý quan trọng để truy xuất chính xác.
+- `human-review-path`: câu hỏi rủi ro cao hoặc cần người dùng xác nhận phạm vi trả lời.
+- `unsupported-path`: câu hỏi ngoài miền pháp luật mà hệ thống hỗ trợ.
+- `fast-path`: đường xử lý nhẹ cho câu hỏi định nghĩa, tra cứu điều luật, low-risk.
 - `legal-agent-path`: pipeline đầy đủ cho câu hỏi pháp lý bình thường hoặc phức tạp.
 
-### 3.3 So sánh execution policy giữa fast-path và legal-agent-path
+### 2.4 Fast-path và legal-agent-path khác nhau ra sao
 
 | Tiêu chí | Fast-path | Legal-agent-path |
 |---|---|---|
-| Mục tiêu | Trả lời nhanh câu hỏi đơn giản | Xử lý đầy đủ câu hỏi pháp lý phức tạp hoặc thông thường |
-| Route đầu vào | Low-risk, intent rõ, hỏi định nghĩa/điều luật trực tiếp | Câu hỏi cần reasoning đầy đủ hoặc evidence chưa chắc |
-| Rewrite query | Tối đa 2 query, gần câu gốc | Multi-query đầy đủ hơn |
-| Retrieve | `top_k_fast` nhỏ, article-first | Top-k lớn hơn, recall cao hơn |
-| Rerank | Mặc định bỏ CrossEncoder | Có thể dùng CrossEncoder đầy đủ |
-| Retrieval loop | Không loop dài, yếu thì escalate | Có retry retrieval |
-| Grounding | 1 lần check | Có revise / retrieve_again / human review |
-| Sources | 1-2 nguồn mạnh nhất | Nhiều nguồn hơn nếu cần |
-| Human review | Không ưu tiên dùng | Có thể kích hoạt khi risk cao hoặc grounding kém |
+| Mục tiêu | Trả lời nhanh | Trả lời chắc chắn hơn |
+| Query rewrite | Ít query hơn | Nhiều query hơn |
+| Retrieval | Top-k nhỏ, article-first | Recall cao hơn |
+| Rerank | Có thể bỏ CrossEncoder | Đầy đủ hơn |
+| Grounding | 1 vòng | Có revise / retrieve_again / human_review |
+| Sources | 1-2 nguồn mạnh nhất | Có thể nhiều nguồn hơn |
 
-## 4. Luồng chi tiết theo nhánh
+## 3. Bộ dữ liệu đang dùng
 
-### 4.1 Fast-path
+### 3.1 Nguồn dữ liệu gốc
 
-```mermaid
-flowchart TD
-    A["fast-path"] --> B["rewrite_query_node<br/>execution_profile=fast"]
-    B --> C["retrieve_node<br/>top_k_fast, article_first_fast"]
-    C --> D["rerank_node<br/>mặc định skip CrossEncoder"]
-    D --> E["retrieval_check_node<br/>1 vòng"]
+Nguồn dữ liệu gốc hiện tại là **Bộ pháp điển điện tử** của Bộ Tư pháp:
 
-    E -->|"retrieval_ok"| F["generate_draft_node<br/>fast answer ngắn"]
-    E -->|"escalate_to_full"| G["chuyển legal-agent-path"]
+- [https://phapdien.moj.gov.vn/TraCuuPhapDien/MainBoPD.aspx](https://phapdien.moj.gov.vn/TraCuuPhapDien/MainBoPD.aspx)
 
-    F --> H["grounding_check_node<br/>single pass"]
-    H -->|"proceed"| I["citation_format_node"]
-    H -->|"escalate_to_full"| G
+Trang này là cổng tra cứu chính thức của Bộ pháp điển. Trong thực tế của repo hiện tại, dữ liệu không được gọi trực tiếp online lúc chạy chatbot, mà được **tải snapshot offline**, parse thành corpus cục bộ, rồi index vào Qdrant.
 
-    G --> J["full legal pipeline"]
-    J --> I
-    I --> K["final_answer_node"]
+### 3.2 Tải về và lưu ở đâu
+
+Luồng dữ liệu hiện tại là:
+
+1. Mở cổng Bộ pháp điển điện tử của Bộ Tư pháp.
+2. Tải snapshot offline của Bộ pháp điển về máy.
+3. Giải nén hoặc chép toàn bộ snapshot vào:
+   - `D:\BTLNLP\chatbot-phap-luat-rag\data\raw\BoPhapDienDienTu`
+4. Chạy TV1 để ingest và tạo dữ liệu chuẩn hóa ở `data/processed`.
+5. Chạy TV2 để build index article-level vào Qdrant.
+
+Lưu ý:
+
+- Repo hiện tại **không có bước tự tải snapshot từ Internet trong runtime chatbot**.
+- `src/tv1_data/sync_official_snapshot.py` là script đồng bộ **từ snapshot local** đang có, không phải downloader từ website.
+
+### 3.3 Snapshot local hiện đang nằm ở đâu
+
+Snapshot đang có trong working tree nằm tại:
+
+- `D:\BTLNLP\chatbot-phap-luat-rag\data\raw\BoPhapDienDienTu`
+
+Thư mục này hiện chứa:
+
+- `BoPhapDien.html`: trang gốc offline.
+- `jsonData.js`: cây dữ liệu đề mục dùng để parse.
+- `demuc\*.html`: các file HTML theo từng đề mục pháp điển.
+- `lib\`: CSS, JS, ảnh và tài nguyên tĩnh của snapshot.
+
+Tại thời điểm README này được cập nhật, snapshot local đang có:
+
+- `306` file HTML trong `demuc\`
+- `57` file tài nguyên trong `lib\`
+
+### 3.4 Sau khi parse, dữ liệu được lưu ở đâu
+
+TV1 sinh ra các artifact chính sau:
+
+- `D:\BTLNLP\chatbot-phap-luat-rag\data\manifests\legal_corpus_manifest.jsonl`
+  - manifest theo từng file nguồn, dùng cho incremental sync.
+- `D:\BTLNLP\chatbot-phap-luat-rag\data\processed\all_chunks.jsonl`
+  - corpus chunk chính để retrieval/indexing.
+- `D:\BTLNLP\chatbot-phap-luat-rag\data\processed\all_chunks.json`
+  - bản JSON đầy đủ của toàn bộ chunks.
+- `D:\BTLNLP\chatbot-phap-luat-rag\data\processed\chunks_preview.csv`
+  - file preview để kiểm tra nhanh.
+- `D:\BTLNLP\chatbot-phap-luat-rag\data\processed\stats.json`
+  - thống kê corpus sau ingest.
+
+### 3.5 Quy mô dữ liệu hiện tại
+
+Theo `D:\BTLNLP\chatbot-phap-luat-rag\data\processed\stats.json`, corpus hiện tại có:
+
+- `306` file nguồn đã parse,
+- `440212` chunks,
+- `537` chunk rỗng,
+- độ dài nội dung trung bình khoảng `384.97` ký tự,
+- độ dài chunk tối đa `800` ký tự.
+
+Ngoài corpus đầy đủ, repo còn có một bộ smoke test nhỏ:
+
+- `D:\BTLNLP\chatbot-phap-luat-rag\data\processed\tv1_smoke`
+
+Bộ này hiện có:
+
+- `1` đề mục nguồn,
+- `564` chunks,
+- dùng rất tiện để kiểm tra nhanh flow ingest hoặc retrieval.
+
+### 3.6 Dữ liệu retrieval thực tế dùng kiểu gì
+
+Hệ thống hiện dùng **article-level retrieval** là chính.
+
+Mỗi article được build thành `retrieval_text` theo dạng:
+
+```text
+{title}. {law_id}. {article}. {article_code}. {article_name}. {de_muc}. {content}
 ```
-
-Đặc điểm của fast-path hiện tại:
-
-- `execution_profile = "fast"` và `fast_path_enabled = true` được gắn từ `route_node`.
-- Rewrite query giới hạn tối đa 2 truy vấn.
-- Retrieval dùng cấu hình nhỏ hơn để ưu tiên precision thay vì recall.
-- Rerank mặc định sắp xếp theo `combined_score`, không dùng CrossEncoder ở cấu hình mặc định.
-- Grounding chỉ chạy 1 lần.
-- Nếu evidence yếu hoặc grounding không đạt, hệ thống **không loop dài** mà chuyển sang `legal-agent-path`.
-- Sau khi hoàn tất, số nguồn hiển thị được giới hạn gọn hơn.
-
-### 4.2 Legal-agent-path
-
-```mermaid
-flowchart TD
-    A["legal-agent-path"] --> B["rewrite_query_node<br/>execution_profile=full"]
-    B --> C["retrieve_node"]
-    C --> D["rerank_node<br/>có thể dùng CrossEncoder"]
-    D --> E["retrieval_check_node"]
-
-    E -->|"retry"| C
-    E -->|"proceed"| F["generate_draft_node"]
-    E -->|"fallback"| G["retrieval_fallback_node"]
-
-    F --> H["grounding_check_node"]
-
-    H -->|"proceed"| I["citation_format_node"]
-    H -->|"retrieve_again"| C
-    H -->|"revise"| J["revise_answer_node"]
-    H -->|"human_review"| K["waiting_user_input<br/>resume_kind=human_review"]
-
-    J --> H
-    G --> I
-    K -->|"user trả lời tiếp<br/>/chat/resume"| A
-    I --> L["final_answer_node"]
-```
-
-Đặc điểm của legal-agent-path hiện tại:
-
-- Chạy `execution_profile = "full"`.
-- Cho phép retrieval loop nếu evidence còn yếu.
-- Có thể revise lại câu trả lời nếu grounding chưa đạt.
-- Có thể chuyển sang `human review` nếu câu hỏi rủi ro cao hoặc cần xác nhận thêm.
-- Phù hợp với câu hỏi pháp lý thực tế, nhiều điều kiện hoặc có tác động đến quyết định pháp lý.
-
-### 4.3 Clarify và human-in-the-loop trong chat
-
-```mermaid
-flowchart TD
-    A["route/grounding phát hiện cần hỏi ngược lại"] --> B["status=waiting_user_input"]
-    B --> C["resume_kind=clarify | human_review"]
-    C --> D["resume_question hiển thị ngay trong chat"]
-
-    D --> E["User nhập tiếp trong ô chat"]
-    E --> F["Frontend tự gọi /chat/resume"]
-    F --> G["builder.resume(...)"]
-    G --> H["graph tiếp tục từ checkpoint"]
-```
-
-Hệ thống hiện dùng một schema thống nhất cho cả clarify và human review:
-
-```json
-{
-  "status": "waiting_user_input",
-  "resume_kind": "clarify | human_review",
-  "resume_question": "<câu assistant hỏi ngược lại>",
-  "thread_id": "thread-...",
-  "session_id": "session-..."
-}
-```
-
-Ý nghĩa:
-
-- **Clarify**: thiếu dữ kiện để truy xuất hoặc trả lời chính xác.
-- **Human review**: không phải thiếu dữ kiện, mà là cần xác nhận phạm vi trả lời ở câu hỏi rủi ro cao.
 
 Ví dụ:
 
-**Clarify**
-
-```json
-{
-  "status": "waiting_user_input",
-  "resume_kind": "clarify",
-  "resume_question": "Bạn muốn hỏi về hành vi vi phạm nào cụ thể?",
-  "thread_id": "thread-001",
-  "session_id": "session-001"
-}
+```text
+Luật Thanh niên. Luật số 57/2020/QH14. Điều 1. Điều 36.3.LQ.1. Thanh niên. Đề mục 36.3 - Thanh niên. Thanh niên là công dân Việt Nam từ đủ 16 tuổi đến 30 tuổi.
 ```
 
-**Human review**
+Điều này giúp các câu kiểu:
 
-```json
-{
-  "status": "waiting_user_input",
-  "resume_kind": "human_review",
-  "resume_question": "Câu hỏi này có thể ảnh hưởng đến quyết định pháp lý thực tế. Bạn muốn hệ thống chỉ phân tích căn cứ pháp luật chung, hay tiếp tục theo tình huống cụ thể của bạn?",
-  "thread_id": "thread-002",
-  "session_id": "session-002"
-}
-```
+- `Điều 1 Luật Thanh niên quy định gì?`
+- `Theo Luật Thanh niên, thanh niên là gì?`
+- `Luật số 57/2020/QH14 nói gì về thanh niên?`
 
-## 5. Logic route hiện tại
+được match tốt hơn nhờ kết hợp cả nội dung và metadata pháp lý.
 
-`route_node` hiện quyết định theo thứ tự ưu tiên sau:
+## 4. Script liên quan đến dữ liệu
 
-1. Nếu câu hỏi thiếu dữ kiện quan trọng như `hành_vi_vi_pham`, `loai_tranh_chap`, `van_ban_phap_luat`, `tham_chieu_dieu_luat`, `chu_the` thì đi `clarify-path`.
-2. Nếu câu hỏi ngoài phạm vi pháp luật hỗ trợ thì đi `unsupported-path`.
-3. Nếu câu hỏi có rủi ro cao thì đi `human-review-path`.
-4. Nếu câu hỏi trực tiếp, low-risk, intent rõ thì đi `fast-path`.
-5. Các trường hợp còn lại đi `legal-agent-path`.
+### 4.1 TV1 ingest
 
-Ví dụ:
+- `D:\BTLNLP\chatbot-phap-luat-rag\src\tv1_data\ingest_bo_phap_dien.py`
+  - parse snapshot local và export toàn bộ artifact TV1.
+- `D:\BTLNLP\chatbot-phap-luat-rag\src\tv1_data\sync_official_snapshot.py`
+  - đồng bộ incremental khi snapshot local thay đổi.
+- `D:\BTLNLP\chatbot-phap-luat-rag\src\tv1_data\parse_clean.py`
+  - parse và làm sạch HTML.
+- `D:\BTLNLP\chatbot-phap-luat-rag\src\tv1_data\chunk_legal_docs.py`
+  - chunk hóa văn bản pháp luật.
 
-- `"Mức phạt là bao nhiêu?"` → `clarify-path`
-- `"Theo Luật Thanh niên, thanh niên là gì?"` → `fast-path`
-- `"Tôi có nên khởi kiện tranh chấp đất đai với hàng xóm không?"` → `human-review-path`
+### 4.2 TV2 indexing
 
-## 6. AgentState và dữ liệu điều phối
+- `D:\BTLNLP\chatbot-phap-luat-rag\src\tv2_index\build_qdrant_index.py`
+  - build index article-level vào Qdrant.
+- `D:\BTLNLP\chatbot-phap-luat-rag\src\tv2_index\search_with_filters.py`
+  - hybrid search + metadata filters + exact legal boost.
+- `D:\BTLNLP\chatbot-phap-luat-rag\src\tv2_index\qdrant_manager.py`
+  - create collection / upsert / alias swap.
+- `D:\BTLNLP\chatbot-phap-luat-rag\src\tv2_index\embedding_registry.py`
+  - registry embedding model.
 
-### 6.1 Các field chính trong AgentState
+## 5. Cấu trúc thư mục chi tiết
 
-```python
-class AgentState(TypedDict, total=False):
-    question: str
-    normalized_question: str
-    intent: str
-    intent_score: float
-    risk_level: str
-    rewritten_queries: list[str]
-    retrieved_docs: list[dict[str, Any]]
-    reranked_docs: list[dict[str, Any]]
-    context: str
-    sources: list[str]
-    draft_answer: str
-    final_answer: str
-    retrieval_ok: bool
-    grounding_ok: bool
-    need_clarify: bool
-    unsupported_query: bool
-    human_review_required: bool
-    review_note: str
-    route_reason: str
-    next_route: str
-    next_action: str
-    loop_count: int
-    history: list[dict[str, Any]]
-    thread_id: str
-    session_id: str
-    interrupt_payload: dict[str, Any] | None
-    retrieval_debug: dict[str, Any]
-    citation_findings: dict[str, Any]
-    unsupported_claims: list[str]
-    missing_evidence: list[str]
-    grounding_score: float
-    reasoning_notes: dict[str, Any]
-    app_checkpoint_id: str
-    clarify_question: str
-    clarify_reason: str
-    risk_reason: str
-    top_intents: list[dict[str, Any]]
-    retrieval_failure_reason: str
-    response_status: str
-    status: str
-    draft_citations: list[str]
-    draft_confidence: float
-    review_response: str
-    clarify_response: str
-```
-
-### 6.2 Các field điều phối đang dùng trong flow hiện tại
-
-Ngoài `AgentState`, runtime hiện còn dùng thêm các field điều phối ở bước route/resume như:
-
-- `resume_kind`
-- `resume_question`
-- `missing_slots`
-- `execution_profile`
-- `fast_path_enabled`
-
-Các field này giúp frontend và graph biết:
-
-- có đang chờ người dùng nhập tiếp hay không,
-- câu hỏi ngược lại cần hiển thị là gì,
-- đang chạy fast-path hay legal-agent-path.
-
-## 7. API contract hiện tại
-
-### 7.1 `POST /chat`
-
-Trường hợp thành công bình thường:
-
-```json
-{
-  "status": "ok",
-  "final_answer": "...",
-  "sources": ["..."],
-  "route": "fast-path",
-  "risk_level": "low",
-  "thread_id": "thread-...",
-  "session_id": "session-..."
-}
-```
-
-Trường hợp chờ người dùng nhập tiếp:
-
-```json
-{
-  "status": "waiting_user_input",
-  "resume_kind": "clarify",
-  "resume_question": "Bạn muốn hỏi về hành vi vi phạm nào cụ thể?",
-  "route": "clarify-path",
-  "risk_level": "medium",
-  "thread_id": "thread-...",
-  "session_id": "session-..."
-}
-```
-
-### 7.2 `POST /chat/stream`
-
-SSE hiện stream các event chính:
-
-- `route`
-- `retrieval_status`
-- `partial_answer`
-- `grounding_status`
-- `clarify_required`
-- `review_required`
-- `final_state`
-
-Ví dụ event khi cần người dùng nhập tiếp:
+Lược đồ dưới đây tập trung vào các thư mục và file có ý nghĩa thực tế. Các thư mục tạm như `__pycache__`, `.pytest_cache`, `.tmp_pytest`, `.idea` được lược bớt.
 
 ```text
-event: review_required
-data: {"status":"waiting_user_input","resume_kind":"human_review","resume_question":"...","thread_id":"...","session_id":"..."}
+D:\BTLNLP\chatbot-phap-luat-rag
+├─ README.md
+├─ requirements.txt
+├─ pytest.ini
+├─ .checkpoints\
+│  └─ ... local JSON checkpoint để resume hội thoại
+├─ configs\
+│  ├─ app.yaml
+│  ├─ indexing.yaml
+│  ├─ prompts.yaml
+│  ├─ retrieval.yaml
+│  └─ routing.yaml
+├─ data\
+│  ├─ chunks\
+│  │  └─ ... thư mục dự phòng/legacy cho artifact chunk riêng
+│  ├─ manifests\
+│  │  ├─ legal_corpus_manifest.jsonl
+│  │  └─ tv1_smoke_manifest.jsonl
+│  ├─ processed\
+│  │  ├─ all_chunks.json
+│  │  ├─ all_chunks.jsonl
+│  │  ├─ chunks_preview.csv
+│  │  ├─ stats.json
+│  │  └─ tv1_smoke\
+│  │     ├─ all_chunks.json
+│  │     ├─ all_chunks.jsonl
+│  │     ├─ chunks_preview.csv
+│  │     └─ stats.json
+│  └─ raw\
+│     └─ BoPhapDienDienTu\
+│        ├─ BoPhapDien.html
+│        ├─ jsonData.js
+│        ├─ demuc\
+│        │  └─ *.html
+│        └─ lib\
+│           └─ ... CSS/JS/ảnh của snapshot
+├─ evaluation\
+│  ├─ eval_grounding.py
+│  ├─ eval_qdrant_bge_m3.py
+│  ├─ eval_ragas.py
+│  └─ eval_retrieval.py
+├─ notebooks\
+│  ├─ 01_eda_legal_corpus.ipynb
+│  ├─ 02_embedding_benchmark.ipynb
+│  ├─ 03_prompt_debug.ipynb
+│  └─ 04_error_analysis.ipynb
+├─ src\
+│  ├─ app\
+│  │  ├─ api\
+│  │  │  ├─ main.py
+│  │  │  └─ routes\
+│  │  │     ├─ chat.py
+│  │  │     └─ stream.py
+│  │  └─ ui\
+│  │     └─ streamlit_app.py
+│  ├─ graph\
+│  │  ├─ builder.py
+│  │  ├─ checkpointing.py
+│  │  ├─ human_review_node.py
+│  │  ├─ state.py
+│  │  └─ subgraphs.py
+│  ├─ tv1_data\
+│  │  ├─ chunk_legal_docs.py
+│  │  ├─ ingest_bo_phap_dien.py
+│  │  ├─ parse_clean.py
+│  │  └─ sync_official_snapshot.py
+│  ├─ tv2_index\
+│  │  ├─ build_qdrant_index.py
+│  │  ├─ embedding_registry.py
+│  │  ├─ qdrant_manager.py
+│  │  ├─ search_with_filters.py
+│  │  └─ swap_active_collection.py
+│  ├─ tv3_retrieval\
+│  │  ├─ fallback_policy.py
+│  │  ├─ rerank_node.py
+│  │  ├─ retrieval_check_node.py
+│  │  ├─ retrieve_node.py
+│  │  └─ rewrite_query_node.py
+│  ├─ tv4_router\
+│  │  ├─ clarify_detector.py
+│  │  ├─ intent_classifier.py
+│  │  ├─ risk_tagger.py
+│  │  └─ route_node.py
+│  └─ tv5_reasoning\
+│     ├─ citation_critic.py
+│     ├─ generate_draft_node.py
+│     ├─ grounding_check_node.py
+│     ├─ prompt_library.py
+│     └─ revise_answer_node.py
+└─ tests\
+   ├─ test_graph_resume.py
+   ├─ test_reasoning_policy.py
+   ├─ test_retrieval_flow.py
+   └─ test_router.py
 ```
 
-### 7.3 `POST /chat/resume`
+## 6. Yêu cầu môi trường
 
-Frontend gọi API này khi người dùng đang ở trạng thái `waiting_user_input` và gửi tiếp một tin nhắn mới.
+### 6.1 Phần mềm cần có
 
-Ví dụ clarify:
+- Python `3.10` hoặc `3.11`
+- Ollama tại `http://localhost:11434`
+- Qdrant tại `http://localhost:6333`
 
-```json
-{
-  "thread_id": "thread-001",
-  "session_id": "session-001",
-  "clarify_response": "Vượt đèn đỏ bằng xe máy"
-}
-```
-
-Ví dụ human review:
-
-```json
-{
-  "thread_id": "thread-002",
-  "session_id": "session-002",
-  "review_response": "Chỉ phân tích căn cứ pháp luật chung trước"
-}
-```
-
-## 8. Cấu trúc thư mục hiện tại
-
-```text
-project_root/
-├── README.md
-├── requirements.txt
-├── configs/
-│   ├── app.yaml
-│   ├── indexing.yaml
-│   ├── prompts.yaml
-│   ├── retrieval.yaml
-│   └── routing.yaml
-├── data/
-├── evaluation/
-├── notebooks/
-├── src/
-│   ├── tv1_data/
-│   ├── tv2_index/
-│   ├── tv3_retrieval/
-│   │   ├── rewrite_query_node.py
-│   │   ├── retrieve_node.py
-│   │   ├── rerank_node.py
-│   │   ├── retrieval_check_node.py
-│   │   └── fallback_policy.py
-│   ├── tv4_router/
-│   │   ├── clarify_detector.py
-│   │   ├── intent_classifier.py
-│   │   ├── risk_tagger.py
-│   │   └── route_node.py
-│   ├── tv5_reasoning/
-│   │   ├── citation_critic.py
-│   │   ├── generate_draft_node.py
-│   │   ├── grounding_check_node.py
-│   │   ├── prompt_library.py
-│   │   └── revise_answer_node.py
-│   ├── graph/
-│   │   ├── builder.py
-│   │   ├── checkpointing.py
-│   │   ├── human_review_node.py
-│   │   ├── state.py
-│   │   └── subgraphs.py
-│   └── app/
-│       ├── api/
-│       │   ├── main.py
-│       │   └── routes/
-│       │       ├── chat.py
-│       │       └── stream.py
-│       └── ui/
-│           └── streamlit_app.py
-└── tests/
-    ├── test_graph_resume.py
-    ├── test_retrieval_flow.py
-    └── test_router.py
-```
-
-## 9. Cấu hình chính cho fast-path
-
-Một số cấu hình quan trọng hiện được dùng để làm fast-path nhẹ hơn:
-
-```yaml
-fast_path_enabled: true
-article_first_fast: true
-top_k_fast: 3
-bm25_top_k_fast: 3
-vector_top_k_fast: 3
-rerank_top_n_fast: 2
-enable_rerank_fast: false
-max_fast_retries: 0
-fast_grounding_single_pass: true
-fast_sources_limit: 2
-max_queries_fast: 2
-```
-
-Ý nghĩa:
-
-- fast-path ưu tiên độ trễ thấp,
-- dùng ít truy vấn hơn,
-- dùng ít nguồn hơn,
-- không chạy revise loop,
-- evidence yếu thì chuyển sang full path thay vì cố tự sửa nhiều vòng.
-
-## 10. Cách chạy hệ thống
-
-### 10.1 Cài dependencies
+### 6.2 Gợi ý tạo môi trường Conda trên Windows
 
 ```powershell
+conda create -n torch_py310 python=3.10 -y
+conda activate torch_py310
+```
+
+## 7. Cài đặt
+
+### 7.1 Cài dependency Python
+
+```powershell
+cd D:\BTLNLP\chatbot-phap-luat-rag
 pip install -r requirements.txt
 ```
 
-### 10.2 Chạy backend FastAPI
+### 7.2 Chuẩn bị Ollama
+
+Model mặc định đang dùng:
+
+- router/reasoning: `qwen2.5:7b`
+- embedding: `bge-m3`
+
+Tải model:
 
 ```powershell
+ollama pull qwen2.5:7b
+ollama pull bge-m3
+```
+
+Chạy Ollama:
+
+```powershell
+ollama serve
+```
+
+### 7.3 Chuẩn bị Qdrant
+
+Nếu chạy bằng Docker:
+
+```powershell
+docker run -p 6333:6333 qdrant/qdrant
+```
+
+## 8. Chạy pipeline dữ liệu
+
+### 8.1 Build lại TV1 từ snapshot local
+
+```powershell
+cd D:\BTLNLP\chatbot-phap-luat-rag
+python -m src.tv1_data.ingest_bo_phap_dien `
+  --input data/raw/BoPhapDienDienTu `
+  --manifest data/manifests/legal_corpus_manifest.jsonl `
+  --output data/processed `
+  --log-level INFO
+```
+
+### 8.2 Đồng bộ incremental khi snapshot local thay đổi
+
+```powershell
+cd D:\BTLNLP\chatbot-phap-luat-rag
+python -m src.tv1_data.sync_official_snapshot `
+  --input data/raw/BoPhapDienDienTu `
+  --manifest data/manifests/legal_corpus_manifest.jsonl `
+  --output data/processed `
+  --log-level INFO
+```
+
+### 8.3 Build Qdrant index
+
+```powershell
+cd D:\BTLNLP\chatbot-phap-luat-rag
+python -m src.tv2_index.build_qdrant_index `
+  --input data/processed/all_chunks.jsonl `
+  --level article `
+  --config configs/indexing.yaml `
+  --version-tag local `
+  --activate-alias `
+  --log-level INFO
+```
+
+Lưu ý:
+
+- `configs/indexing.yaml` hiện dùng `text_field_for_embedding: retrieval_text`
+- Qdrant timeout đang là `120` giây
+- code đã có guard cắt payload quá lớn trước khi upsert
+
+## 9. Chạy hệ thống
+
+### 9.1 Chạy backend FastAPI
+
+```powershell
+cd D:\BTLNLP\chatbot-phap-luat-rag
 python -m uvicorn src.app.api.main:app --host 127.0.0.1 --port 8000 --reload
 ```
 
-### 10.3 Chạy Streamlit UI
+Các URL hữu ích:
+
+- Swagger: [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
+- Health: [http://127.0.0.1:8000/health](http://127.0.0.1:8000/health)
+
+### 9.2 Chạy frontend Streamlit
+
+Mở terminal khác:
 
 ```powershell
+cd D:\BTLNLP\chatbot-phap-luat-rag
 streamlit run src/app/ui/streamlit_app.py
 ```
 
-### 10.4 Chạy test chính
+UI hiện tại hỗ trợ:
+
+- tin nhắn người dùng bên phải,
+- tin nhắn assistant bên trái,
+- streaming SSE,
+- fallback từ `/chat/stream` sang `/chat`,
+- render `resume_question` ngay trong khung chat,
+- local conversation history từ `.checkpoints`.
+
+### 9.3 Các endpoint chính
+
+- `POST /chat`
+- `POST /chat/stream`
+- `POST /chat/resume`
+- `GET /health`
+
+## 10. Chạy test
+
+Chạy toàn bộ test:
 
 ```powershell
-python -m pytest tests/test_graph_resume.py -v
-python -m pytest tests/test_retrieval_flow.py -q
-python -m pytest tests/test_router.py -q
+cd D:\BTLNLP\chatbot-phap-luat-rag
+python -m pytest tests -q
 ```
 
-## 11. Kết quả kiến trúc sau khi cập nhật
+Chạy test theo nhóm:
 
-Sau khi refactor, hệ thống đã đạt các thay đổi chính sau:
+```powershell
+python -m pytest tests/test_router.py -q
+python -m pytest tests/test_graph_resume.py -q
+python -m pytest tests/test_retrieval_flow.py -q
+python -m pytest tests/test_reasoning_policy.py -q
+```
 
-- `fast-path` không còn là nhãn route giả mà là một nhánh xử lý thật sự nhẹ hơn.
-- `clarify` và `human review` được thống nhất về schema `waiting_user_input`.
-- Frontend hiển thị `resume_question` ngay trong khung chat và tự dùng `/chat/resume` cho tin nhắn tiếp theo.
-- Streaming SSE bám đúng event backend và giữ được `event_trace`.
-- Checkpoint/resume tiếp tục đúng theo `thread_id` và `session_id`.
+Tại thời điểm README này được cập nhật, suite local đang pass:
 
-## 12. Kết luận
+```text
+33 passed
+```
 
-Kiến trúc hiện tại đã chuyển từ một pipeline RAG tuyến tính sang một hệ thống agentic có điều phối rõ ràng, tách execution policy theo mức độ phức tạp của câu hỏi và có cơ chế tương tác hai chiều với người dùng trong hội thoại. Đây là điểm khác biệt quan trọng của phiên bản hiện tại so với thiết kế ban đầu.
+## 11. Kịch bản chạy thử nên dùng
 
-Các điểm cốt lõi của phiên bản hiện tại là:
+### 11.1 Direct legal lookup
 
-- route chính xác hơn giữa `clarify`, `fast-path`, `full legal path` và `human review`,
-- execution policy của fast-path nhẹ hơn thật sự,
-- hỗ trợ `waiting_user_input` ngay trong chat,
-- giữ được resume theo checkpoint,
-- phù hợp để mở rộng tiếp cho đánh giá, logging và triển khai thực tế.
+```text
+Điều 1 Luật Thanh niên quy định gì?
+Theo Luật Thanh niên, thanh niên là gì?
+```
+
+Kỳ vọng:
+
+- route vào `fast-path` hoặc `fast-path -> legal-agent-path`
+- không `human_review` oan
+- trả lời trực tiếp theo điều luật
+
+### 11.2 Legal overview
+
+```text
+Quyền của thanh niên là gì?
+Nghĩa vụ của thanh niên được quy định như thế nào?
+```
+
+Kỳ vọng:
+
+- retrieval ra nhiều điều liên quan
+- có thể revise nếu cần
+- hạn chế `clarify` oan và `human_review` oan
+
+### 11.3 Clarify
+
+```text
+Mức phạt là bao nhiêu?
+```
+
+Kỳ vọng:
+
+- `status = waiting_user_input`
+- `resume_kind = clarify`
+- UI hiện câu hỏi làm rõ ngay trong chat
+
+### 11.4 Human review
+
+```text
+Tôi có nên khởi kiện tranh chấp đất đai với hàng xóm không?
+```
+
+Kỳ vọng:
+
+- `status = waiting_user_input`
+- `resume_kind = human_review`
+- UI yêu cầu người dùng xác nhận phạm vi trả lời
+
+### 11.5 Unsupported
+
+```text
+Thời tiết Hà Nội hôm nay thế nào?
+```
+
+Kỳ vọng:
+
+- route `unsupported-path`
+- không hiện `Nguồn trích dẫn`
+- không rơi oan sang `waiting_user_input`
+
+## 12. Cấu hình quan trọng
+
+### 12.1 `configs/app.yaml`
+
+- `timeout_seconds: 600`
+- `default_timeout_seconds: 600`
+- `max_reasoning_loops: 2`
+- `max_retrieval_rounds: 3`
+- `checkpoint_dir: .checkpoints`
+
+### 12.2 `configs/routing.yaml`
+
+Router hiện đang bật LLM:
+
+```yaml
+model_type: llm_based
+llm_provider: ollama
+llm_model: ${OLLAMA_ROUTER_MODEL:qwen2.5:7b}
+llm_base_url: ${OLLAMA_BASE_URL:http://localhost:11434}
+```
+
+Muốn quay lại rule-based:
+
+```yaml
+model_type: rule_based
+```
+
+### 12.3 `configs/retrieval.yaml`
+
+Một số điểm đáng chú ý:
+
+- `article_only: true`
+- `allow_chunk_fallback: false`
+- `cross_encoder_device: cpu`
+- `fast_path_enabled: true`
+- `min_valid_sources: 1`
+- `min_valid_sources_fast: 1`
+
+### 12.4 `configs/indexing.yaml`
+
+- embedding provider mặc định: `ollama`
+- fallback embedding: `sentence_transformers`
+- model embedding mặc định: `bge-m3`
+- `text_field_for_embedding: retrieval_text`
+- `max_retrieval_text_chars: 12000`
+- `max_payload_content_chars: 50000`
