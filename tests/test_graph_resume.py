@@ -6,6 +6,7 @@ from typing import Any, Mapping
 
 import pytest
 
+from src.app.api.routes.chat import build_chat_response
 from src.graph.builder import AppConfig, GraphDependencies, build_graph
 from src.graph.checkpointing import BaseCheckpointStore, CheckpointNotFoundError
 from src.graph.human_review_node import human_review_node
@@ -541,3 +542,35 @@ def test_resume_session_thread_mismatch_handled() -> None:
             session_id="session-other",
             review_response="Đồng ý",
         )
+
+
+def test_build_chat_response_exposes_intent_and_clarify_fields() -> None:
+    state = create_initial_state(
+        question="Quyền của thanh niên là gì?",
+        thread_id="thread-chat-response-001",
+        session_id="session-chat-response-001",
+    )
+    state.update(
+        {
+            "response_status": "waiting_user_input",
+            "final_answer": "",
+            "intent": "hoi_dinh_nghia",
+            "intent_score": 0.91,
+            "next_route": "clarify-path",
+            "risk_level": "low",
+            "need_clarify": True,
+            "missing_slots": ["van_ban_phap_luat"],
+            "clarify_question": "Bạn đang muốn hỏi theo luật hoặc văn bản pháp luật nào cụ thể?",
+        }
+    )
+
+    response = build_chat_response(state)
+
+    assert response.intent == "hoi_dinh_nghia"
+    assert response.intent_score == pytest.approx(0.91)
+    assert response.route == "clarify-path"
+    assert response.risk_level == "low"
+    assert response.need_clarify is True
+    assert response.missing_slots == ["van_ban_phap_luat"]
+    assert response.clarify_question == "Bạn đang muốn hỏi theo luật hoặc văn bản pháp luật nào cụ thể?"
+    assert response.resume_question == "Bạn đang muốn hỏi theo luật hoặc văn bản pháp luật nào cụ thể?"

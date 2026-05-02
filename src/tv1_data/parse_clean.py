@@ -41,11 +41,26 @@ DATE_PATTERNS = (
     re.compile(r"có hiệu lực kể từ ngày\s+(\d{1,2}/\d{1,2}/\d{4})", re.IGNORECASE),
     re.compile(r"có hiệu lực từ ngày\s+(\d{1,2}/\d{1,2}/\d{4})", re.IGNORECASE),
 )
+TEXTUAL_DATE_PATTERNS = (
+    re.compile(
+        r"có hiệu lực thi hành kể từ ngày\s+(\d{1,2})\s+tháng\s+(\d{1,2})\s+năm\s+(\d{4})",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"có hiệu lực kể từ ngày\s+(\d{1,2})\s+tháng\s+(\d{1,2})\s+năm\s+(\d{4})",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"có hiệu lực từ ngày\s+(\d{1,2})\s+tháng\s+(\d{1,2})\s+năm\s+(\d{4})",
+        re.IGNORECASE,
+    ),
+)
 SOURCE_NOTE_DATE_PATTERN = re.compile(
     r"ngày\s+(?:\d{1,2}/\d{1,2}/\d{4}|\d{1,2}\s+tháng\s+\d{1,2}\s+năm\s+\d{4})",
     re.IGNORECASE,
 )
 ISSUER_PATTERNS = (
+    "Chủ tịch nước",
     "Ủy ban Thường vụ Quốc hội",
     "Quốc hội",
     "Chính phủ",
@@ -74,6 +89,43 @@ ISSUER_PATTERNS = (
     "Ủy ban nhân dân",
     "Hội đồng nhân dân",
 )
+
+ISSUER_CODE_MAP = {
+    "QH": "Quốc hội",
+    "UBTVQH": "Ủy ban Thường vụ Quốc hội",
+    "CP": "Chính phủ",
+    "TTG": "Thủ tướng Chính phủ",
+    "HĐTP": "Hội đồng Thẩm phán Tòa án nhân dân tối cao",
+    "CTN": "Chủ tịch nước",
+    "BCA": "Bộ Công an",
+    "BQP": "Bộ Quốc phòng",
+    "BNV": "Bộ Nội vụ",
+    "BTP": "Bộ Tư pháp",
+    "TC": "Bộ Tài chính",
+    "TCT": "Tổng cục Thuế",
+    "BTC": "Bộ Tài chính",
+    "BKHĐT": "Bộ Kế hoạch và Đầu tư",
+    "BCT": "Bộ Công Thương",
+    "BNN": "Bộ Nông nghiệp và Phát triển nông thôn",
+    "BNNPTTN": "Bộ Nông nghiệp và Phát triển nông thôn",
+    "BNNPTNT": "Bộ Nông nghiệp và Phát triển nông thôn",
+    "BGTVT": "Bộ Giao thông vận tải",
+    "BXD": "Bộ Xây dựng",
+    "BTNMT": "Bộ Tài nguyên và Môi trường",
+    "BTTTT": "Bộ Thông tin và Truyền thông",
+    "BGDĐT": "Bộ Giáo dục và Đào tạo",
+    "BYT": "Bộ Y tế",
+    "BLĐTBXH": "Bộ Lao động - Thương binh và Xã hội",
+    "BVHTTDL": "Bộ Văn hóa, Thể thao và Du lịch",
+    "BKHCN": "Bộ Khoa học và Công nghệ",
+    "BNG": "Bộ Ngoại giao",
+    "NHNN": "Ngân hàng Nhà nước Việt Nam",
+    "UBTDTT": "Ủy ban Thể dục thể thao",
+    "TANDTC": "Tòa án nhân dân tối cao",
+    "VKSNDTC": "Viện kiểm sát nhân dân tối cao",
+    "UBND": "Ủy ban nhân dân",
+    "HĐND": "Hội đồng nhân dân",
+}
 
 
 class MissingDependencyError(RuntimeError):
@@ -310,6 +362,108 @@ def _detect_issuer_fallback(note: str) -> str:
     return ""
 
 
+def _normalize_code_tokens(value: str) -> list[str]:
+    normalized = clean_text(value).upper()
+    normalized = re.sub(r"\s*-\s*", "-", normalized)
+    normalized = normalized.replace(".", "-")
+    return [token for token in re.split(r"[^0-9A-ZÀ-ỸĐ-]+", normalized) if token]
+
+
+def _infer_issuer_from_compact_text(value: str) -> str:
+    normalized = clean_text(value).upper()
+    if not normalized:
+        return ""
+
+    inferred: list[str] = []
+    for token in _normalize_code_tokens(value):
+        token_parts = [part for part in token.split("-") if part]
+        for token_part in token_parts:
+            issuer = ""
+            if token_part.startswith("UBTVQH"):
+                issuer = ISSUER_CODE_MAP["UBTVQH"]
+            elif re.fullmatch(r"QH\d+", token_part) or token_part == "QH":
+                issuer = ISSUER_CODE_MAP["QH"]
+            elif token_part in ISSUER_CODE_MAP:
+                issuer = ISSUER_CODE_MAP[token_part]
+
+            if issuer and issuer not in inferred:
+                inferred.append(issuer)
+
+    if inferred:
+        return "; ".join(inferred)
+
+    return ""
+
+
+def _infer_issuer_from_note_structure(note: str) -> str:
+    normalized = clean_text(note)
+    lowered = normalized.lower()
+    if not normalized:
+        return ""
+
+    structural_view = re.sub(r"^điều\s+[0-9a-zà-ỹ.\-]+\s+", "", lowered, flags=re.IGNORECASE).strip()
+    if structural_view.startswith("pháp lệnh"):
+        return "Ủy ban Thường vụ Quốc hội"
+    if structural_view.startswith("lệnh"):
+        return "Chủ tịch nước"
+    if structural_view.startswith("nghị định"):
+        return "Chính phủ"
+    if structural_view.startswith("luật") or structural_view.startswith("bộ luật"):
+        return "Quốc hội"
+    if structural_view.startswith("quyết định") and "-ttg" in normalized.lower():
+        return "Thủ tướng Chính phủ"
+    if structural_view.startswith("nghị quyết") and ("hđtp" in normalized.lower() or "hội đồng thẩm phán" in normalized.lower()):
+        return "Hội đồng Thẩm phán Tòa án nhân dân tối cao"
+
+    return ""
+
+
+def _infer_issuer_from_law_context(law_id: str, title: str, note: str) -> str:
+    for value in (law_id, title):
+        issuer = _infer_issuer_from_compact_text(value)
+        if issuer:
+            return issuer
+
+    issuer = _infer_issuer_from_note_structure(note)
+    if issuer:
+        return issuer
+
+    normalized = clean_text(law_id).upper()
+    if normalized.startswith("BỘ LUẬT SỐ") or normalized.startswith("LUẬT SỐ"):
+        return "Quốc hội"
+    if normalized.startswith("PHÁP LỆNH SỐ"):
+        return "Ủy ban Thường vụ Quốc hội"
+    if normalized.startswith("LỆNH SỐ"):
+        return "Chủ tịch nước"
+    if normalized.startswith("NGHỊ ĐỊNH SỐ"):
+        return "Chính phủ"
+    if normalized.startswith("NGHỊ QUYẾT SỐ") and "HĐND" in normalized:
+        return "Hội đồng nhân dân"
+    if normalized.startswith("NGHỊ QUYẾT SỐ") and "QH" in normalized:
+        return "Quốc hội"
+    if normalized.startswith("QUYẾT ĐỊNH SỐ") and "TTG" in normalized:
+        return "Thủ tướng Chính phủ"
+    if normalized.startswith("CHỈ THỊ SỐ") and "TTG" in normalized:
+        return "Thủ tướng Chính phủ"
+
+    return ""
+
+
+def _extract_effective_date(note: str) -> str:
+    for pattern in DATE_PATTERNS:
+        match = pattern.search(note)
+        if match:
+            return match.group(1)
+
+    for pattern in TEXTUAL_DATE_PATTERNS:
+        match = pattern.search(note)
+        if match:
+            day, month, year = match.groups()
+            return f"{int(day):02d}/{int(month):02d}/{year}"
+
+    return ""
+
+
 def parse_source_note(source_note: str) -> SourceMetadata:
     """Extract source-document metadata from a Bộ pháp điển source note."""
 
@@ -346,13 +500,10 @@ def parse_source_note(source_note: str) -> SourceMetadata:
             issuer = clean_text(issuer_tail[4:])
     if not issuer:
         issuer = _detect_issuer_fallback(note)
+    if not issuer:
+        issuer = _infer_issuer_from_law_context(law_id, title, note)
 
-    effective_date = ""
-    for pattern in DATE_PATTERNS:
-        match = pattern.search(note)
-        if match:
-            effective_date = match.group(1)
-            break
+    effective_date = _extract_effective_date(note)
 
     return SourceMetadata(
         law_id=law_id,

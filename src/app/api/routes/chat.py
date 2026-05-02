@@ -75,12 +75,16 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     status: str
     final_answer: str = ""
+    intent: str = ""
+    intent_score: float = 0.0
     resume_kind: str = ""
     resume_question: str = ""
     clarify_question: str = ""
     sources: list[str] = Field(default_factory=list)
     route: str = ""
     risk_level: str = ""
+    need_clarify: bool = False
+    missing_slots: list[str] = Field(default_factory=list)
     thread_id: str = ""
     session_id: str = ""
     review_note: str = ""
@@ -105,12 +109,16 @@ def build_chat_response(state: AgentState) -> ChatResponse:
     return ChatResponse(
         status=status,
         final_answer=str(state.get("final_answer") or ""),
+        intent=str(state.get("intent") or ""),
+        intent_score=float(state.get("intent_score") or 0.0),
         resume_kind=str(state.get("resume_kind") or ""),
         resume_question=resume_question,
         clarify_question=str(state.get("clarify_question") or ""),
         sources=list(state.get("sources") or []),
         route=str(state.get("next_route") or ""),
         risk_level=str(state.get("risk_level") or ""),
+        need_clarify=bool(state.get("need_clarify") or False),
+        missing_slots=list(state.get("missing_slots") or []),
         thread_id=str(state.get("thread_id") or ""),
         session_id=str(state.get("session_id") or ""),
         review_note=str(state.get("review_note") or ""),
