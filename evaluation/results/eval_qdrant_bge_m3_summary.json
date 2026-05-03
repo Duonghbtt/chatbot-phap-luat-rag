@@ -1,0 +1,41 @@
+{
+  "data_source": "hf://YuITC/Vietnamese-legal-documents[auto]",
+  "query_count": 1000,
+  "summaries": [
+    {
+      "level": "article",
+      "use_filters": false,
+      "top_k": 5,
+      "query_count": 1000,
+      "ground_truth_case_count": 1000,
+      "latency_mean_ms": 2387.6585,
+      "latency_p50_ms": 2387.252,
+      "latency_p95_ms": 2448.801,
+      "avg_result_count": 5.0,
+      "hit_rate_at_1": 0.952,
+      "hit_rate_at_3": 0.983,
+      "hit_rate_at_5": 0.992,
+      "hit_rate_at_10": null,
+      "mrr_at_k": 0.9766,
+      "filter_hit_rate": null
+    },
+    {
+      "level": "article",
+      "use_filters": false,
+      "top_k": 10,
+      "query_count": 1000,
+      "ground_truth_case_count": 1000,
+      "latency_mean_ms": 2389.2097,
+      "latency_p50_ms": 2389.054,
+      "latency_p95_ms": 2435.644,
+      "avg_result_count": 10.0,
+      "hit_rate_at_1": 0.952,
+      "hit_rate_at_3": 0.983,
+      "hit_rate_at_5": 0.992,
+      "hit_rate_at_10": 0.998,
+      "mrr_at_k": 0.9715,
+      "filter_hit_rate": null
+    }
+  ],
+  "details_count": 2000
+}

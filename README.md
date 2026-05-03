@@ -1,4 +1,4 @@
-# Hệ thống Hỏi đáp Văn bản Pháp luật đa tác tử dùng RAG và LangGraph
+m# Hệ thống Hỏi đáp Văn bản Pháp luật đa tác tử dùng RAG và LangGraph
 
 > README này mô tả đúng trạng thái code hiện tại của repo `Vietnamese Legal QA RAG`.
 > Stack chính: `LangGraph + FastAPI + Streamlit + Qdrant + Ollama + Hybrid Retrieval`.
@@ -242,10 +242,9 @@ D:\BTLNLP\chatbot-phap-luat-rag
 │        └─ lib\
 │           └─ ... CSS/JS/ảnh của snapshot
 ├─ evaluation\
-│  ├─ eval_grounding.py
 │  ├─ eval_qdrant_bge_m3.py
 │  ├─ eval_ragas.py
-│  └─ eval_retrieval.py
+│  └─ run_langsmith_eval.py
 ├─ notebooks\
 │  ├─ 01_eda_legal_corpus.ipynb
 │  ├─ 02_embedding_benchmark.ipynb
@@ -459,9 +458,147 @@ Tại thời điểm README này được cập nhật, suite local đang pass:
 33 passed
 ```
 
-## 11. Kịch bản chạy thử nên dùng
+## 11. Chạy evaluation
 
-### 11.1 Direct legal lookup
+Hệ thống hiện dùng 3 lớp evaluation chính:
+
+- `evaluation/run_langsmith_eval.py`: đánh giá end-to-end hành vi router/API
+- `evaluation/eval_qdrant_bge_m3.py`: đánh giá retrieval trên Qdrant
+- `evaluation/eval_ragas.py`: đánh giá answer quality bằng thư viện `ragas`
+
+Thư mục `evaluation/` hiện chỉ giữ lại 3 script trên để tránh chồng chéo vai trò:
+
+- `run_langsmith_eval.py`: đo chất lượng điều phối end-to-end
+- `eval_qdrant_bge_m3.py`: đo retrieval trên dataset pháp luật tiếng Việt
+- `eval_ragas.py`: đo chất lượng câu trả lời cuối cùng
+
+### 11.0 Bộ dữ liệu dùng cho evaluation
+
+Ba lớp evaluation hiện tại dùng ba nguồn dữ liệu khác nhau:
+
+- `vietnamese-legal-qa-routing-eval-v1` trên LangSmith:
+  - dataset nội bộ để chấm `intent`, `route`, `risk`, `clarify`, `missing_slots`
+  - dùng cho `evaluation/run_langsmith_eval.py`
+- `YuITC/Vietnamese-Legal-Doc-Retrieval-Data` trên Hugging Face:
+  - dùng để benchmark retrieval pháp luật tiếng Việt
+  - script `evaluation/eval_qdrant_bge_m3.py` sẽ ưu tiên load dataset này nếu không truyền `--queries`
+  - trong thực tế Hugging Face có thể redirect sang repo dataset thật `YuITC/Vietnamese-legal-documents`, và script đã hỗ trợ alias này
+- `thangvip/vietnamese-legal-qa` trên Hugging Face:
+  - dùng để benchmark chất lượng câu trả lời legal QA
+  - script `evaluation/eval_ragas.py` sẽ ưu tiên load dataset này nếu không truyền `--input`
+  - script sẽ lấy `question`, `reference_answer`, `article_content`, sau đó gọi local backend `/chat` để lấy answer của hệ thống rồi chấm bằng `ragas`
+
+### 11.1 LangSmith end-to-end evaluation
+
+Script này dùng dataset LangSmith `vietnamese-legal-qa-routing-eval-v1` và chấm các metric:
+
+- `api_success`
+- `intent_accuracy`
+- `route_accuracy`
+- `risk_accuracy`
+- `clarify_accuracy`
+- `missing_slot_accuracy`
+- `retrieval_hint_present`
+
+Terminal 1:
+
+```powershell
+cd D:\BTLNLP\chatbot-phap-luat-rag
+python -m uvicorn src.app.api.main:app --host 127.0.0.1 --port 8000
+```
+
+Terminal 2:
+
+```powershell
+cd D:\BTLNLP\chatbot-phap-luat-rag
+$env:LANGSMITH_TRACING="true"
+$env:LANGSMITH_API_KEY="your_key_here"
+$env:LANGSMITH_PROJECT="legal-rag-tv6"
+$env:EVAL_LIMIT="5"
+$env:EVAL_DEBUG="true"
+python evaluation\run_langsmith_eval.py
+```
+
+Bỏ `EVAL_LIMIT` nếu muốn chạy toàn bộ dataset.
+
+### 11.2 Retrieval evaluation trên dataset YuITC
+
+Script `evaluation/eval_qdrant_bge_m3.py` sẽ ưu tiên load dataset Hugging Face `YuITC/Vietnamese-Legal-Doc-Retrieval-Data` nếu không truyền `--queries`.
+Dataset public hiện tại trên Hugging Face có thể được redirect về repo thật `YuITC/Vietnamese-legal-documents`; script đã hỗ trợ alias này.
+
+Điều kiện cần:
+
+- Qdrant đang chạy
+- article-level index đã build xong
+- môi trường Python cài được `datasets`
+
+Ví dụ chạy 50 mẫu:
+
+```powershell
+cd D:\BTLNLP\chatbot-phap-luat-rag
+python evaluation\eval_qdrant_bge_m3.py `
+  --level article `
+  --top-k 5 10 `
+  --limit 50 `
+  --output evaluation\results
+```
+
+### 11.3 Answer quality evaluation bằng RAGAS
+
+Script `evaluation/eval_ragas.py` sẽ ưu tiên load dataset Hugging Face `thangvip/vietnamese-legal-qa` nếu không truyền `--input`. Sau đó script gọi local backend `/chat` để lấy answer của chatbot, rồi chấm bằng `ragas`.
+
+Điều kiện cần:
+
+- backend FastAPI đang chạy
+- Ollama đang chạy
+- môi trường Python cài được `ragas`, `datasets`, `pyarrow`, `openai`
+
+Nếu chạy trên Windows và gặp lỗi `DLL load failed` từ `datasets` hoặc `pyarrow`, hãy cài lại dependency từ `requirements.txt` trước khi chạy RAGAS eval.
+
+Terminal 1:
+
+```powershell
+cd D:\BTLNLP\chatbot-phap-luat-rag
+python -m uvicorn src.app.api.main:app --host 127.0.0.1 --port 8000
+```
+
+Terminal 2:
+
+```powershell
+cd D:\BTLNLP\chatbot-phap-luat-rag
+$env:RAGAS_BASE_URL="http://127.0.0.1:11434"
+$env:RAGAS_LLM_MODEL="qwen2.5:7b"
+$env:RAGAS_EMBED_MODEL="bge-m3"
+python evaluation\eval_ragas.py `
+  --limit 20 `
+  --mode llm `
+  --api-url http://127.0.0.1:8000/chat `
+  --output-dir evaluation\results
+```
+
+Nếu chỉ muốn chạy metric không cần LLM judge:
+
+```powershell
+python evaluation\eval_ragas.py `
+  --limit 20 `
+  --mode non_llm `
+  --api-url http://127.0.0.1:8000/chat `
+  --output-dir evaluation\results
+```
+
+### 11.4 File kết quả evaluation
+
+Các script evaluation sẽ ghi kết quả vào:
+
+- `evaluation/results/eval_qdrant_bge_m3_summary.json`
+- `evaluation/results/eval_qdrant_bge_m3_summary.csv`
+- `evaluation/results/eval_ragas_summary.json`
+- `evaluation/results/eval_ragas_summary.csv`
+- `evaluation/results/eval_ragas_details.jsonl`
+
+## 12. Kịch bản chạy thử nên dùng
+
+### 12.1 Direct legal lookup
 
 ```text
 Điều 1 Luật Thanh niên quy định gì?
@@ -474,7 +611,7 @@ Kỳ vọng:
 - không `human_review` oan
 - trả lời trực tiếp theo điều luật
 
-### 11.2 Legal overview
+### 12.2 Legal overview
 
 ```text
 Quyền của thanh niên là gì?
@@ -487,7 +624,7 @@ Kỳ vọng:
 - có thể revise nếu cần
 - hạn chế `clarify` oan và `human_review` oan
 
-### 11.3 Clarify
+### 12.3 Clarify
 
 ```text
 Mức phạt là bao nhiêu?

@@ -4,16 +4,54 @@ import argparse
 import csv
 import json
 import logging
+import os
+import re
 import statistics
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from src.tv2_index.embedding_registry import DEFAULT_CONFIG_PATH
 from src.tv2_index.search_with_filters import QdrantSearchService, normalize_filters, result_matches_filters
 
 LOGGER = logging.getLogger(__name__)
+DEFAULT_RETRIEVAL_DATASET = os.getenv(
+    "RETRIEVAL_HF_DATASET",
+    "YuITC/Vietnamese-Legal-Doc-Retrieval-Data",
+)
+DATASET_ALIASES = {
+    "YuITC/Vietnamese-Legal-Doc-Retrieval-Data": "YuITC/Vietnamese-legal-documents",
+}
+_STOPWORDS = {
+    "các",
+    "cho",
+    "có",
+    "của",
+    "đã",
+    "đang",
+    "để",
+    "được",
+    "hoặc",
+    "khi",
+    "không",
+    "là",
+    "một",
+    "như",
+    "này",
+    "theo",
+    "thì",
+    "từ",
+    "và",
+    "về",
+    "vì",
+    "với",
+}
 
 
 @dataclass(slots=True)
@@ -27,6 +65,7 @@ class QueryCase:
     ground_truth_article_codes: list[str] = field(default_factory=list)
     ground_truth_law_ids: list[str] = field(default_factory=list)
     ground_truth_titles: list[str] = field(default_factory=list)
+    reference_contexts: list[str] = field(default_factory=list)
 
 
 def setup_logging(level: str = "INFO") -> None:
@@ -51,6 +90,107 @@ def _parse_list_field(value: Any) -> list[str]:
     return [item.strip() for item in text.split(",") if item.strip()]
 
 
+def _normalize_text(value: str) -> str:
+    lowered = (value or "").lower()
+    lowered = re.sub(r"\s+", " ", lowered)
+    lowered = re.sub(r"[^\w\s]", " ", lowered, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", lowered).strip()
+
+
+def _informative_tokens(value: str) -> set[str]:
+    return {
+        token
+        for token in re.findall(r"\w+", _normalize_text(value), flags=re.UNICODE)
+        if len(token) > 2 and token not in _STOPWORDS and not token.isdigit()
+    }
+
+
+def _result_to_text(result: Mapping[str, Any]) -> str:
+    metadata = dict(result.get("metadata") or {})
+    parts = [
+        result.get("content"),
+        metadata.get("article_name"),
+        metadata.get("title"),
+        metadata.get("law_id"),
+        metadata.get("source_note"),
+    ]
+    return " ".join(str(part).strip() for part in parts if part)
+
+
+def _matches_reference_context(result: Mapping[str, Any], reference_context: str) -> bool:
+    result_text = _normalize_text(_result_to_text(result))
+    context_text = _normalize_text(reference_context)
+    if not result_text or not context_text:
+        return False
+
+    shorter, longer = sorted((result_text, context_text), key=len)
+    if len(shorter) >= 48 and shorter in longer:
+        return True
+
+    result_tokens = _informative_tokens(result_text)
+    context_tokens = _informative_tokens(context_text)
+    if not result_tokens or not context_tokens:
+        return False
+
+    overlap = len(result_tokens & context_tokens)
+    min_size = min(len(result_tokens), len(context_tokens))
+    return overlap >= 12 or (min_size > 0 and (overlap / min_size) >= 0.55)
+
+
+def _resolve_dataset_name(dataset_name: str) -> str:
+    text = (dataset_name or "").strip()
+    return DATASET_ALIASES.get(text, text)
+
+
+def _select_dataset_split(dataset: Any, requested_split: str) -> Sequence[Mapping[str, Any]]:
+    if not isinstance(dataset, Mapping):
+        return dataset
+    if requested_split and requested_split.lower() != "auto":
+        if requested_split not in dataset:
+            available = ", ".join(str(key) for key in dataset.keys())
+            raise KeyError(f"Split `{requested_split}` not found. Available splits: {available}")
+        return dataset[requested_split]
+    for candidate in ("test", "validation", "train"):
+        if candidate in dataset:
+            return dataset[candidate]
+    first_key = next(iter(dataset.keys()))
+    return dataset[first_key]
+
+
+def load_hf_query_cases(dataset_name: str, *, split: str = "auto", limit: int | None = None) -> list[QueryCase]:
+    try:
+        from datasets import load_dataset
+    except Exception as exc:  # pragma: no cover - environment dependent
+        raise RuntimeError(
+            "Failed to import Hugging Face `datasets`. Please install compatible `datasets`/`pyarrow` packages."
+        ) from exc
+
+    resolved_name = _resolve_dataset_name(dataset_name)
+    dataset = load_dataset(resolved_name)
+    split_rows = _select_dataset_split(dataset, split)
+    cases: list[QueryCase] = []
+    for index, raw_row in enumerate(split_rows):
+        if limit is not None and index >= limit:
+            break
+        row = dict(raw_row)
+        query = str(row.get("question") or row.get("query") or "").strip()
+        if not query:
+            continue
+        reference_contexts = _parse_list_field(
+            row.get("context_list") or row.get("reference_contexts") or row.get("ground_truth_contexts")
+        )
+        cases.append(
+            QueryCase(
+                query=query,
+                filters={},
+                ground_truth_ids=_parse_list_field(row.get("cid") or row.get("ground_truth_ids")),
+                ground_truth_titles=_parse_list_field(row.get("title") or row.get("ground_truth_titles")),
+                reference_contexts=reference_contexts,
+            )
+        )
+    return cases
+
+
 def parse_query_case(raw: Mapping[str, Any]) -> QueryCase:
     query = str(raw.get("query") or raw.get("question") or "").strip()
     if not query:
@@ -71,6 +211,9 @@ def parse_query_case(raw: Mapping[str, Any]) -> QueryCase:
         ),
         ground_truth_law_ids=_parse_list_field(raw.get("ground_truth_law_ids") or raw.get("law_id")),
         ground_truth_titles=_parse_list_field(raw.get("ground_truth_titles") or raw.get("title")),
+        reference_contexts=_parse_list_field(
+            raw.get("reference_contexts") or raw.get("ground_truth_contexts") or raw.get("context_list")
+        ),
     )
 
 
@@ -130,7 +273,41 @@ def result_matches_ground_truth(result: Mapping[str, Any], query_case: QueryCase
         return True
     if query_case.ground_truth_titles and candidates["title"] in set(query_case.ground_truth_titles):
         return True
+    if query_case.reference_contexts and any(
+        _matches_reference_context(result, reference_context)
+        for reference_context in query_case.reference_contexts
+    ):
+        return True
     return False
+
+
+def _safe_mean(values: Sequence[float]) -> float | None:
+    if not values:
+        return None
+    return round(statistics.mean(values), 4)
+
+
+def _safe_quantile(values: Sequence[float], quantile: float) -> float | None:
+    if not values:
+        return None
+    if len(values) == 1:
+        return round(float(values[0]), 3)
+    sorted_values = sorted(float(value) for value in values)
+    index = (len(sorted_values) - 1) * quantile
+    lower = int(index)
+    upper = min(lower + 1, len(sorted_values) - 1)
+    if lower == upper:
+        return round(sorted_values[lower], 3)
+    fraction = index - lower
+    blended = sorted_values[lower] * (1.0 - fraction) + sorted_values[upper] * fraction
+    return round(blended, 3)
+
+
+def _find_first_relevant_rank(results: Sequence[Mapping[str, Any]], query_case: QueryCase) -> int | None:
+    for rank, result in enumerate(results, start=1):
+        if result_matches_ground_truth(result, query_case):
+            return rank
+    return None
 
 
 def compute_filter_hit_rate(results: Sequence[Mapping[str, Any]], filters: Mapping[str, Any]) -> float | None:
@@ -155,9 +332,10 @@ def benchmark_scenario(
 
     latencies_ms: list[float] = []
     filter_hit_rates: list[float] = []
+    result_counts: list[float] = []
     details: list[dict[str, Any]] = []
-    recall_hits_at_5 = 0
-    recall_hits_at_10 = 0
+    hit_counts = {1: 0, 3: 0, 5: 0, 10: 0}
+    reciprocal_ranks: list[float] = []
     gt_case_count = 0
 
     for case in query_cases:
@@ -179,6 +357,7 @@ def benchmark_scenario(
             )
         latency_ms = (time.perf_counter() - start) * 1000.0
         latencies_ms.append(latency_ms)
+        result_counts.append(float(len(results)))
 
         has_ground_truth = any(
             [
@@ -189,18 +368,23 @@ def benchmark_scenario(
                 case.ground_truth_titles,
             ]
         )
+        relevant_rank = None
+        hit_at_1 = None
+        hit_at_3 = None
         hit_at_5 = None
         hit_at_10 = None
         if has_ground_truth:
             gt_case_count += 1
-            if top_k >= 5:
-                hit_at_5 = any(result_matches_ground_truth(result, case) for result in results[:5])
-                if hit_at_5:
-                    recall_hits_at_5 += 1
-            if top_k >= 10:
-                hit_at_10 = any(result_matches_ground_truth(result, case) for result in results[:10])
-                if hit_at_10:
-                    recall_hits_at_10 += 1
+            relevant_rank = _find_first_relevant_rank(results[:top_k], case)
+            if relevant_rank is not None:
+                reciprocal_ranks.append(1.0 / relevant_rank)
+            hit_at_1 = relevant_rank is not None and relevant_rank <= 1
+            hit_at_3 = relevant_rank is not None and relevant_rank <= 3
+            hit_at_5 = relevant_rank is not None and relevant_rank <= 5
+            hit_at_10 = relevant_rank is not None and relevant_rank <= 10
+            for cutoff in hit_counts:
+                if relevant_rank is not None and relevant_rank <= cutoff:
+                    hit_counts[cutoff] += 1
 
         scenario_filter_hit_rate = compute_filter_hit_rate(results, applied_filters)
         if scenario_filter_hit_rate is not None:
@@ -216,6 +400,10 @@ def benchmark_scenario(
                 "latency_ms": round(latency_ms, 3),
                 "result_count": len(results),
                 "filter_hit_rate": scenario_filter_hit_rate,
+                "first_relevant_rank": relevant_rank,
+                "reciprocal_rank": round(1.0 / relevant_rank, 4) if relevant_rank else None,
+                "hit_at_1": hit_at_1,
+                "hit_at_3": hit_at_3,
                 "hit_at_5": hit_at_5,
                 "hit_at_10": hit_at_10,
             }
@@ -226,10 +414,17 @@ def benchmark_scenario(
         "use_filters": use_filters,
         "top_k": top_k,
         "query_count": len(query_cases),
+        "ground_truth_case_count": gt_case_count,
+        "latency_mean_ms": _safe_mean(latencies_ms),
         "latency_p50_ms": round(statistics.median(latencies_ms), 3) if latencies_ms else None,
-        "recall_at_5": round(recall_hits_at_5 / gt_case_count, 4) if gt_case_count and top_k >= 5 else None,
-        "recall_at_10": round(recall_hits_at_10 / gt_case_count, 4) if gt_case_count and top_k >= 10 else None,
-        "filter_hit_rate": round(statistics.mean(filter_hit_rates), 4) if filter_hit_rates else None,
+        "latency_p95_ms": _safe_quantile(latencies_ms, 0.95),
+        "avg_result_count": _safe_mean(result_counts),
+        "hit_rate_at_1": round(hit_counts[1] / gt_case_count, 4) if gt_case_count and top_k >= 1 else None,
+        "hit_rate_at_3": round(hit_counts[3] / gt_case_count, 4) if gt_case_count and top_k >= 3 else None,
+        "hit_rate_at_5": round(hit_counts[5] / gt_case_count, 4) if gt_case_count and top_k >= 5 else None,
+        "hit_rate_at_10": round(hit_counts[10] / gt_case_count, 4) if gt_case_count and top_k >= 10 else None,
+        "mrr_at_k": _safe_mean(reciprocal_ranks),
+        "filter_hit_rate": _safe_mean(filter_hit_rates),
     }
     return summary, details
 
@@ -241,9 +436,16 @@ def write_summary_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
         "use_filters",
         "top_k",
         "query_count",
+        "ground_truth_case_count",
+        "latency_mean_ms",
         "latency_p50_ms",
-        "recall_at_5",
-        "recall_at_10",
+        "latency_p95_ms",
+        "avg_result_count",
+        "hit_rate_at_1",
+        "hit_rate_at_3",
+        "hit_rate_at_5",
+        "hit_rate_at_10",
+        "mrr_at_k",
         "filter_hit_rate",
     ]
     with path.open("w", encoding="utf-8", newline="") as handle:
@@ -255,7 +457,10 @@ def write_summary_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
 
 def run_benchmark(
     *,
-    queries_path: str | Path,
+    queries_path: str | Path | None = None,
+    dataset_name: str | None = None,
+    dataset_split: str = "auto",
+    dataset_limit: int | None = None,
     level: str,
     config_path: str | Path | None = None,
     collection_name: str | None = None,
@@ -266,7 +471,16 @@ def run_benchmark(
     """Benchmark Qdrant retrieval for chunk/article and filter/no-filter scenarios."""
 
     resolved_logger = logger or LOGGER
-    query_cases = load_query_cases(queries_path)
+    if queries_path:
+        query_cases = load_query_cases(queries_path)
+        data_source = str(Path(queries_path).resolve())
+    else:
+        query_cases = load_hf_query_cases(
+            dataset_name or DEFAULT_RETRIEVAL_DATASET,
+            split=dataset_split,
+            limit=dataset_limit,
+        )
+        data_source = f"hf://{_resolve_dataset_name(dataset_name or DEFAULT_RETRIEVAL_DATASET)}[{dataset_split}]"
     service = QdrantSearchService(config_path=config_path or DEFAULT_CONFIG_PATH, logger=resolved_logger)
     levels = [level] if level != "both" else ["chunk", "article"]
 
@@ -303,7 +517,16 @@ def run_benchmark(
     detail_jsonl = output_root / "eval_qdrant_bge_m3_details.jsonl"
 
     summary_json.write_text(
-        json.dumps({"summaries": summaries, "details_count": len(details)}, ensure_ascii=False, indent=2),
+        json.dumps(
+            {
+                "data_source": data_source,
+                "query_count": len(query_cases),
+                "summaries": summaries,
+                "details_count": len(details),
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
         encoding="utf-8",
     )
     write_summary_csv(summary_csv, summaries)
@@ -317,12 +540,27 @@ def run_benchmark(
         "summary_csv": str(summary_csv),
         "details_jsonl": str(detail_jsonl),
         "scenario_count": len(summaries),
+        "data_source": data_source,
     }
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Evaluate Qdrant + bge-m3 retrieval quality and latency.")
-    parser.add_argument("--queries", required=True, help="Path to query+ground-truth JSON/JSONL/CSV.")
+    parser.add_argument(
+        "--queries",
+        help="Path to query+ground-truth JSON/JSONL/CSV. If omitted, the script loads the Hugging Face retrieval dataset.",
+    )
+    parser.add_argument(
+        "--dataset",
+        default=DEFAULT_RETRIEVAL_DATASET,
+        help="Hugging Face dataset name for retrieval evaluation when --queries is omitted.",
+    )
+    parser.add_argument(
+        "--split",
+        default="auto",
+        help="Dataset split to use for Hugging Face loading (default: auto -> test/validation/train).",
+    )
+    parser.add_argument("--limit", type=int, help="Optional max number of dataset rows to evaluate.")
     parser.add_argument(
         "--level",
         default="both",
@@ -354,6 +592,9 @@ def main() -> None:
     setup_logging(args.log_level)
     summary = run_benchmark(
         queries_path=args.queries,
+        dataset_name=args.dataset,
+        dataset_split=args.split,
+        dataset_limit=args.limit,
         level=args.level,
         config_path=args.config,
         collection_name=args.collection,

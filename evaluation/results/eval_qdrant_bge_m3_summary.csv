@@ -1,0 +1,3 @@
+level,use_filters,top_k,query_count,ground_truth_case_count,latency_mean_ms,latency_p50_ms,latency_p95_ms,avg_result_count,hit_rate_at_1,hit_rate_at_3,hit_rate_at_5,hit_rate_at_10,mrr_at_k,filter_hit_rate
+article,False,5,1000,1000,2387.6585,2387.252,2448.801,5.0,0.952,0.983,0.992,,0.9766,
+article,False,10,1000,1000,2389.2097,2389.054,2435.644,10.0,0.952,0.983,0.992,0.998,0.9715,

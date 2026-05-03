@@ -9,7 +9,7 @@ from __future__ import annotations
 # $env:LANGSMITH_API_KEY="..."
 # $env:LANGSMITH_PROJECT="legal-rag-tv6"
 # $env:EVAL_LIMIT="5"
-# python tests\run_langsmith_eval.py
+# python evaluation\run_langsmith_eval.py
 
 import json
 import os
