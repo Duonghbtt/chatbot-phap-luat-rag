@@ -1,2 +1,0 @@
-{"grounding_ok": true, "grounding_score": 0.9, "unsupported_claims": [], "missing_evidence": [], "citation_findings": {"citation_ok": true}, "next_action": "proceed", "gold_grounding_ok": true, "gold_next_action": "proceed", "gold_citation_ok": true}
-{"grounding_ok": false, "grounding_score": 0.4, "unsupported_claims": ["claim a"], "missing_evidence": ["evidence x", "evidence y"], "citation_findings": {"citation_ok": false}, "next_action": "revise", "gold_grounding_ok": false, "gold_next_action": "revise", "gold_citation_ok": false}
