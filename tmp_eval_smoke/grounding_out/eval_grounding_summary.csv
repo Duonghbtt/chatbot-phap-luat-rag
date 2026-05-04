@@ -1,2 +1,0 @@
-sample_count,grounded_answer_rate,unsupported_claim_rate,citation_correctness_rate,avg_missing_evidence_count,avg_unsupported_claim_count,avg_grounding_score,avg_faithfulness,avg_answer_relevancy,next_action_distribution,human_review_rate,revise_rate,retrieve_again_rate,gold_grounding_agreement,gold_action_accuracy,gold_citation_accuracy
-2,0.5,0.5,0.5,1.0,0.5,0.65,,,"{'proceed': 0.5, 'revise': 0.5}",0.0,0.5,0.0,1.0,1.0,1.0
