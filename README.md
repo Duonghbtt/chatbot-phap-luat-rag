@@ -244,11 +244,6 @@ D:\BTLNLP\chatbot-phap-luat-rag
 ├─ evaluation\
 │  ├─ eval_qdrant_bge_m3.py
 │  └─ run_langsmith_eval.py
-├─ notebooks\
-│  ├─ 01_eda_legal_corpus.ipynb
-│  ├─ 02_embedding_benchmark.ipynb
-│  ├─ 03_prompt_debug.ipynb
-│  └─ 04_error_analysis.ipynb
 ├─ src\
 │  ├─ app\
 │  │  ├─ api\
