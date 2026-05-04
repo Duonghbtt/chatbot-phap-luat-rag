@@ -1,4 +1,4 @@
-m# Hệ thống Hỏi đáp Văn bản Pháp luật đa tác tử dùng RAG và LangGraph
+# Hệ thống Hỏi đáp Văn bản Pháp luật đa tác tử dùng RAG và LangGraph
 
 > README này mô tả đúng trạng thái code hiện tại của repo `Vietnamese Legal QA RAG`.
 > Stack chính: `LangGraph + FastAPI + Streamlit + Qdrant + Ollama + Hybrid Retrieval`.
@@ -243,7 +243,6 @@ D:\BTLNLP\chatbot-phap-luat-rag
 │           └─ ... CSS/JS/ảnh của snapshot
 ├─ evaluation\
 │  ├─ eval_qdrant_bge_m3.py
-│  ├─ eval_ragas.py
 │  └─ run_langsmith_eval.py
 ├─ notebooks\
 │  ├─ 01_eda_legal_corpus.ipynb
@@ -400,10 +399,17 @@ Lưu ý:
 ### 9.1 Chạy backend FastAPI
 
 ```powershell
-cd D:\BTLNLP\chatbot-phap-luat-rag
-python -m uvicorn src.app.api.main:app --host 127.0.0.1 --port 8000 --reload
+python -m uvicorn src.app.api.main:app --host 127.0.0.1 --port 8000
 ```
 
+- Muốn kết hợp với LangSmith tracing, set thêm biến môi trường:
+```powershell
+$env:LANGSMITH_TRACING = "true"
+$env:LANGSMITH_API_KEY = "your_key_here"
+$env:LANGSMITH_PROJECT = "legal-rag-tv6"
+$env:LANGSMITH_WORKSPACE_ID = "optional-workspace-id"
+python -m uvicorn src.app.api.main:app --host 127.0.0.1 --port 8000
+```
 Các URL hữu ích:
 
 - Swagger: [http://127.0.0.1:8000/docs](http://127.0.0.1:8000/docs)
@@ -414,7 +420,6 @@ Các URL hữu ích:
 Mở terminal khác:
 
 ```powershell
-cd D:\BTLNLP\chatbot-phap-luat-rag
 streamlit run src/app/ui/streamlit_app.py
 ```
 
@@ -439,7 +444,6 @@ UI hiện tại hỗ trợ:
 Chạy toàn bộ test:
 
 ```powershell
-cd D:\BTLNLP\chatbot-phap-luat-rag
 python -m pytest tests -q
 ```
 
@@ -460,21 +464,19 @@ Tại thời điểm README này được cập nhật, suite local đang pass:
 
 ## 11. Chạy evaluation
 
-Hệ thống hiện dùng 3 lớp evaluation chính:
+Hệ thống hiện dùng 2 lớp evaluation chính:
 
 - `evaluation/run_langsmith_eval.py`: đánh giá end-to-end hành vi router/API
 - `evaluation/eval_qdrant_bge_m3.py`: đánh giá retrieval trên Qdrant
-- `evaluation/eval_ragas.py`: đánh giá answer quality bằng thư viện `ragas`
 
-Thư mục `evaluation/` hiện chỉ giữ lại 3 script trên để tránh chồng chéo vai trò:
+Thư mục `evaluation/` hiện chỉ giữ lại 2 script trên để tránh chồng chéo vai trò:
 
 - `run_langsmith_eval.py`: đo chất lượng điều phối end-to-end
 - `eval_qdrant_bge_m3.py`: đo retrieval trên dataset pháp luật tiếng Việt
-- `eval_ragas.py`: đo chất lượng câu trả lời cuối cùng
 
 ### 11.0 Bộ dữ liệu dùng cho evaluation
 
-Ba lớp evaluation hiện tại dùng ba nguồn dữ liệu khác nhau:
+Hai lớp evaluation hiện tại dùng hai nguồn dữ liệu khác nhau:
 
 - `vietnamese-legal-qa-routing-eval-v1` trên LangSmith:
   - dataset nội bộ để chấm `intent`, `route`, `risk`, `clarify`, `missing_slots`
@@ -483,10 +485,6 @@ Ba lớp evaluation hiện tại dùng ba nguồn dữ liệu khác nhau:
   - dùng để benchmark retrieval pháp luật tiếng Việt
   - script `evaluation/eval_qdrant_bge_m3.py` sẽ ưu tiên load dataset này nếu không truyền `--queries`
   - trong thực tế Hugging Face có thể redirect sang repo dataset thật `YuITC/Vietnamese-legal-documents`, và script đã hỗ trợ alias này
-- `thangvip/vietnamese-legal-qa` trên Hugging Face:
-  - dùng để benchmark chất lượng câu trả lời legal QA
-  - script `evaluation/eval_ragas.py` sẽ ưu tiên load dataset này nếu không truyền `--input`
-  - script sẽ lấy `question`, `reference_answer`, `article_content`, sau đó gọi local backend `/chat` để lấy answer của hệ thống rồi chấm bằng `ragas`
 
 ### 11.1 LangSmith end-to-end evaluation
 
@@ -503,14 +501,12 @@ Script này dùng dataset LangSmith `vietnamese-legal-qa-routing-eval-v1` và ch
 Terminal 1:
 
 ```powershell
-cd D:\BTLNLP\chatbot-phap-luat-rag
 python -m uvicorn src.app.api.main:app --host 127.0.0.1 --port 8000
 ```
 
 Terminal 2:
 
 ```powershell
-cd D:\BTLNLP\chatbot-phap-luat-rag
 $env:LANGSMITH_TRACING="true"
 $env:LANGSMITH_API_KEY="your_key_here"
 $env:LANGSMITH_PROJECT="legal-rag-tv6"
@@ -543,58 +539,14 @@ python evaluation\eval_qdrant_bge_m3.py `
   --output evaluation\results
 ```
 
-### 11.3 Answer quality evaluation bằng RAGAS
-
-Script `evaluation/eval_ragas.py` sẽ ưu tiên load dataset Hugging Face `thangvip/vietnamese-legal-qa` nếu không truyền `--input`. Sau đó script gọi local backend `/chat` để lấy answer của chatbot, rồi chấm bằng `ragas`.
-
-Điều kiện cần:
-
-- backend FastAPI đang chạy
-- Ollama đang chạy
-- môi trường Python cài được `ragas`, `datasets`, `pyarrow`, `openai`
-
-Nếu chạy trên Windows và gặp lỗi `DLL load failed` từ `datasets` hoặc `pyarrow`, hãy cài lại dependency từ `requirements.txt` trước khi chạy RAGAS eval.
-
-Terminal 1:
-
-```powershell
-cd D:\BTLNLP\chatbot-phap-luat-rag
-python -m uvicorn src.app.api.main:app --host 127.0.0.1 --port 8000
-```
-
-Terminal 2:
-
-```powershell
-cd D:\BTLNLP\chatbot-phap-luat-rag
-$env:RAGAS_BASE_URL="http://127.0.0.1:11434"
-$env:RAGAS_LLM_MODEL="qwen2.5:7b"
-$env:RAGAS_EMBED_MODEL="bge-m3"
-python evaluation\eval_ragas.py `
-  --limit 20 `
-  --mode llm `
-  --api-url http://127.0.0.1:8000/chat `
-  --output-dir evaluation\results
-```
-
-Nếu chỉ muốn chạy metric không cần LLM judge:
-
-```powershell
-python evaluation\eval_ragas.py `
-  --limit 20 `
-  --mode non_llm `
-  --api-url http://127.0.0.1:8000/chat `
-  --output-dir evaluation\results
-```
-
-### 11.4 File kết quả evaluation
+### 11.3 File kết quả evaluation
 
 Các script evaluation sẽ ghi kết quả vào:
 
+- LangSmith end-to-end evaluation:
+  - kết quả hiển thị trực tiếp trên dashboard LangSmith theo từng experiment
 - `evaluation/results/eval_qdrant_bge_m3_summary.json`
 - `evaluation/results/eval_qdrant_bge_m3_summary.csv`
-- `evaluation/results/eval_ragas_summary.json`
-- `evaluation/results/eval_ragas_summary.csv`
-- `evaluation/results/eval_ragas_details.jsonl`
 
 ## 12. Kịch bản chạy thử nên dùng
 
@@ -636,7 +588,7 @@ Kỳ vọng:
 - `resume_kind = clarify`
 - UI hiện câu hỏi làm rõ ngay trong chat
 
-### 11.4 Human review
+### 12.4 Human review
 
 ```text
 Tôi có nên khởi kiện tranh chấp đất đai với hàng xóm không?
@@ -648,7 +600,7 @@ Kỳ vọng:
 - `resume_kind = human_review`
 - UI yêu cầu người dùng xác nhận phạm vi trả lời
 
-### 11.5 Unsupported
+### 12.5 Unsupported
 
 ```text
 Thời tiết Hà Nội hôm nay thế nào?
